@@ -130,8 +130,63 @@
     transition: width 0.15s linear;
   }
 
+  /* Colour override panel, bottom-right, mirroring the badge. */
+  #paletteBtn {
+    position: fixed;
+    right: 12px;
+    bottom: 12px;
+    width: 34px; height: 34px;
+    border-radius: 50%;
+    border: none;
+    background: var(--badge-bg);
+    color: var(--ink);
+    font-family: inherit;
+    font-size: 14px;
+    cursor: pointer;
+    z-index: 10;
+    opacity: 0.35;
+    transition: opacity 0.3s ease;
+  }
+  #paletteBtn:hover, #paletteBtn:focus-visible { opacity: 1; }
+  #palette {
+    position: fixed;
+    right: 12px;
+    bottom: 54px;
+    background: var(--badge-bg);
+    border-radius: 10px;
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    font-size: 13px;
+    z-index: 10;
+  }
+  #palette label {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  #palette input[type="color"] {
+    width: 34px; height: 24px;
+    border: none; padding: 0;
+    background: none;
+    cursor: pointer;
+  }
+  #palette button {
+    border: 1px solid var(--ink-dim);
+    background: none;
+    color: var(--ink);
+    font-family: inherit;
+    font-size: 12.5px;
+    border-radius: 6px;
+    padding: 4px 8px;
+    cursor: pointer;
+  }
+  #palette button:hover { border-color: var(--ink); }
+
   @media (prefers-reduced-motion: reduce) {
-    #badge, #progress .bar { transition: none; }
+    #badge, #progress .bar, #paletteBtn { transition: none; }
   }
 </style>
 </head>
@@ -148,6 +203,13 @@
 </div>
 
 <div id="badge"><span class="dot"></span><span id="badgeText">Connecting</span></div>
+
+<button id="paletteBtn" title="Colours" aria-label="Colour settings">Aa</button>
+<div id="palette" class="hidden">
+  <label>Background <input type="color" id="pickBg"></label>
+  <label>Text <input type="color" id="pickText"></label>
+  <button id="followDm">Follow DM</button>
+</div>
 <div id="progress"><div class="bar" id="progressBar"></div></div>
 
 <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
@@ -299,6 +361,55 @@
     }
   }
 
+  /* ---- Colours: DM-sent values with optional player overrides ----------- */
+
+  var dmColors = { bg: "#000000", text: "#ffffff" };
+  var overrides = { bg: null, text: null };
+  try {
+    var saved = JSON.parse(localStorage.getItem("dv-viewer-colors") || "{}");
+    if (/^#[0-9a-fA-F]{6}$/.test(saved.bg || "")) overrides.bg = saved.bg;
+    if (/^#[0-9a-fA-F]{6}$/.test(saved.text || "")) overrides.text = saved.text;
+  } catch (e) {}
+
+  function saveOverrides() {
+    try { localStorage.setItem("dv-viewer-colors", JSON.stringify(overrides)); } catch (e) {}
+  }
+
+  // Restyles whatever's currently on screen. Called on every render and
+  // every picker change, so overrides apply live without a resend.
+  function applyColors() {
+    stage.style.background = overrides.bg || dmColors.bg;
+    var t = content.querySelector(".text");
+    if (t) t.style.color = overrides.text || dmColors.text;
+    pickBg.value = overrides.bg || dmColors.bg;
+    pickText.value = overrides.text || dmColors.text;
+  }
+
+  var paletteBtn = document.getElementById("paletteBtn");
+  var palette = document.getElementById("palette");
+  var pickBg = document.getElementById("pickBg");
+  var pickText = document.getElementById("pickText");
+
+  paletteBtn.addEventListener("click", function () {
+    palette.classList.toggle("hidden");
+  });
+  pickBg.addEventListener("input", function () {
+    overrides.bg = pickBg.value;
+    saveOverrides();
+    applyColors();
+  });
+  pickText.addEventListener("input", function () {
+    overrides.text = pickText.value;
+    saveOverrides();
+    applyColors();
+  });
+  document.getElementById("followDm").addEventListener("click", function () {
+    overrides.bg = null;
+    overrides.text = null;
+    saveOverrides();
+    applyColors();
+  });
+
   /* ---- Rendering -------------------------------------------------------- */
 
   function clearContent() {
@@ -310,26 +421,28 @@
   function showImage(blob, bg) {
     clearContent();
     idle.classList.add("hidden");
-    stage.style.background = bg || "#000000";
+    dmColors.bg = bg || "#000000";
     currentUrl = URL.createObjectURL(blob);
     var img = document.createElement("img");
     img.src = currentUrl;
     img.alt = "";
     content.appendChild(img);
+    applyColors();
   }
 
   function showText(msg) {
     clearContent();
     idle.classList.add("hidden");
-    stage.style.background = msg.backgroundColor || "#000000";
+    dmColors.bg = msg.backgroundColor || "#000000";
+    dmColors.text = msg.textColor || "#ffffff";
     var div = document.createElement("div");
     div.className = "text";
     div.textContent = msg.text || "";
-    div.style.color = msg.textColor || "#ffffff";
     if (msg.fontFamily && msg.fontFamily !== "inherit") {
       div.style.fontFamily = msg.fontFamily;
     }
     content.appendChild(div);
+    applyColors();
   }
 
   /* ---- Zoom and pan ------------------------------------------------------ */
