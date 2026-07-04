@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Dual View — Remote Table</title>
+<style>
+  :root {
+    --ink: #e8e2d4;
+    --ink-dim: #9a9484;
+    --badge-bg: rgba(20, 17, 12, 0.82);
+    --ok: #8fb96a;
+    --warn: #d0a04a;
+    --bad: #c2634f;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; overflow: hidden; }
+  body {
+    background: #14110c;
+    color: var(--ink);
+    font-family: Georgia, 'Times New Roman', serif;
+    touch-action: none;
+    overscroll-behavior: none;
+  }
+
+  /* The stage fills the window; its background follows whatever the DM's
+     popout is using, sent with each payload. */
+  #stage {
+    position: fixed;
+    inset: 0;
+    overflow: hidden;
+    cursor: grab;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  #stage.dragging { cursor: grabbing; }
+
+  #content {
+    transform-origin: 50% 50%;
+    will-change: transform;
+    user-select: none;
+    -webkit-user-drag: none;
+    flex-shrink: 0;
+  }
+  #content img {
+    display: block;
+    max-width: 100vw;
+    max-height: 100vh;
+    object-fit: contain;
+    -webkit-user-drag: none;
+    pointer-events: none;
+  }
+  #content .text {
+    width: 100vw;
+    height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    padding: 6%;
+    white-space: pre-wrap;
+    font-size: clamp(20px, 5.5vmin, 64px);
+    line-height: 1.3;
+  }
+
+  /* Empty and waiting states. */
+  #idle {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    text-align: center;
+    padding: 24px;
+  }
+  #idle h1 {
+    font-size: clamp(22px, 4vmin, 34px);
+    font-weight: normal;
+    letter-spacing: 0.06em;
+  }
+  #idle p { color: var(--ink-dim); font-size: 15px; max-width: 42ch; line-height: 1.5; }
+  #idle .rule {
+    width: 120px; height: 1px;
+    background: linear-gradient(90deg, transparent, var(--ink-dim), transparent);
+  }
+  .hidden { display: none !important; }
+
+  /* Connection badge, bottom-left, out of the way of most map corners. */
+  #badge {
+    position: fixed;
+    left: 12px;
+    bottom: 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    background: var(--badge-bg);
+    border-radius: 999px;
+    font-size: 12.5px;
+    letter-spacing: 0.04em;
+    color: var(--ink);
+    pointer-events: none;
+    opacity: 1;
+    transition: opacity 0.6s ease;
+    z-index: 10;
+  }
+  #badge.faded { opacity: 0; }
+  #badge .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--warn);
+  }
+  #badge.ok .dot { background: var(--ok); }
+  #badge.bad .dot { background: var(--bad); }
+
+  /* Transfer progress, only shown while a large image is arriving. */
+  #progress {
+    position: fixed;
+    left: 0; right: 0; bottom: 0;
+    height: 3px;
+    background: transparent;
+    z-index: 11;
+  }
+  #progress .bar {
+    height: 100%;
+    width: 0%;
+    background: var(--ink-dim);
+    transition: width 0.15s linear;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    #badge, #progress .bar { transition: none; }
+  }
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <div id="content"></div>
+</div>
+
+<div id="idle">
+  <h1>Remote Table</h1>
+  <div class="rule"></div>
+  <p id="idleMsg">Connecting…</p>
+</div>
+
+<div id="badge"><span class="dot"></span><span id="badgeText">Connecting</span></div>
+<div id="progress"><div class="bar" id="progressBar"></div></div>
+
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script>
+(function () {
+  "use strict";
+
+  var room = new URLSearchParams(location.search).get("room");
+
+  var stage = document.getElementById("stage");
+  var content = document.getElementById("content");
+  var idle = document.getElementById("idle");
+  var idleMsg = document.getElementById("idleMsg");
+  var badge = document.getElementById("badge");
+  var badgeText = document.getElementById("badgeText");
+  var progressBar = document.getElementById("progressBar");
+
+  if (!room) {
+    idleMsg.textContent = "No room in the link. Ask your DM to copy the viewer link again from Dual View's settings.";
+    badge.classList.add("bad");
+    badgeText.textContent = "No room ID";
+    return;
+  }
+
+  /* ---- Connection state ------------------------------------------------ */
+
+  var peer = null;
+  var conn = null;
+  var retryTimer = null;
+  var badgeFadeTimer = null;
+
+  function setBadge(state, text, fade) {
+    badge.classList.remove("ok", "bad", "faded");
+    if (state) badge.classList.add(state);
+    badgeText.textContent = text;
+    if (badgeFadeTimer) clearTimeout(badgeFadeTimer);
+    if (fade) badgeFadeTimer = setTimeout(function () { badge.classList.add("faded"); }, 2500);
+  }
+
+  function scheduleRetry(msg) {
+    if (retryTimer) return;
+    setBadge("bad", msg || "Reconnecting…");
+    if (!content.hasChildNodes()) {
+      idle.classList.remove("hidden");
+      idleMsg.textContent = "Waiting for your DM… this page will connect on its own once their table is up.";
+    }
+    retryTimer = setTimeout(function () {
+      retryTimer = null;
+      connect();
+    }, 4000);
+  }
+
+  function connect() {
+    if (conn && conn.open) return;
+    if (!peer || peer.destroyed) {
+      peer = new Peer();
+      peer.on("error", function (err) {
+        // "peer-unavailable" just means the DM isn't broadcasting yet.
+        if (err && err.type === "peer-unavailable") {
+          scheduleRetry("DM not broadcasting");
+        } else {
+          scheduleRetry("Connection trouble");
+        }
+      });
+      peer.on("disconnected", function () {
+        try { peer.reconnect(); } catch (e) { scheduleRetry(); }
+      });
+      peer.on("open", dial);
+      return;
+    }
+    dial();
+  }
+
+  function dial() {
+    setBadge(null, "Connecting…");
+    try {
+      conn = peer.connect(room, { reliable: true });
+    } catch (e) {
+      scheduleRetry();
+      return;
+    }
+    conn.on("open", function () {
+      setBadge("ok", "Connected", true);
+      if (!content.hasChildNodes()) {
+        idleMsg.textContent = "Connected. Waiting for the DM to send something…";
+      }
+    });
+    conn.on("data", onData);
+    conn.on("close", function () { scheduleRetry("Disconnected"); });
+    conn.on("error", function () { scheduleRetry("Disconnected"); });
+  }
+
+  /* ---- Protocol: text | head + chunks + end ---------------------------- */
+
+  var incoming = null; // { id, chunks: [], received, total, size, mime, bg }
+  var currentUrl = null;
+
+  function toUint8(b) {
+    if (b instanceof Uint8Array) return b;
+    if (b instanceof ArrayBuffer) return new Uint8Array(b);
+    if (b && b.buffer) return new Uint8Array(b.buffer, b.byteOffset || 0, b.byteLength);
+    return null;
+  }
+
+  function setProgress(f) {
+    progressBar.style.width = (f == null ? 0 : Math.round(f * 100)) + "%";
+  }
+
+  function onData(msg) {
+    if (!msg || typeof msg !== "object") return;
+
+    if (msg.k === "text") {
+      incoming = null;
+      setProgress(null);
+      showText(msg);
+      return;
+    }
+
+    if (msg.k === "head") {
+      incoming = {
+        id: msg.id,
+        total: msg.chunks,
+        received: 0,
+        parts: new Array(msg.chunks),
+        mime: msg.mime || "application/octet-stream",
+        bg: msg.backgroundColor || "#000000",
+      };
+      setProgress(0);
+      return;
+    }
+
+    if (msg.k === "chunk") {
+      if (!incoming || msg.id !== incoming.id) return; // stale transfer
+      var bytes = toUint8(msg.b);
+      if (!bytes) return;
+      if (!incoming.parts[msg.i]) incoming.received += 1;
+      incoming.parts[msg.i] = bytes;
+      if (incoming.total > 4) setProgress(incoming.received / incoming.total);
+      return;
+    }
+
+    if (msg.k === "end") {
+      if (!incoming || msg.id !== incoming.id) return;
+      if (incoming.received !== incoming.total) { incoming = null; setProgress(null); return; }
+      var blob = new Blob(incoming.parts, { type: incoming.mime });
+      showImage(blob, incoming.bg);
+      incoming = null;
+      setProgress(null);
+    }
+  }
+
+  /* ---- Rendering -------------------------------------------------------- */
+
+  function clearContent() {
+    content.innerHTML = "";
+    if (currentUrl) { URL.revokeObjectURL(currentUrl); currentUrl = null; }
+    resetView();
+  }
+
+  function showImage(blob, bg) {
+    clearContent();
+    idle.classList.add("hidden");
+    stage.style.background = bg || "#000000";
+    currentUrl = URL.createObjectURL(blob);
+    var img = document.createElement("img");
+    img.src = currentUrl;
+    img.alt = "";
+    content.appendChild(img);
+  }
+
+  function showText(msg) {
+    clearContent();
+    idle.classList.add("hidden");
+    stage.style.background = msg.backgroundColor || "#000000";
+    var div = document.createElement("div");
+    div.className = "text";
+    div.textContent = msg.text || "";
+    div.style.color = msg.textColor || "#ffffff";
+    if (msg.fontFamily && msg.fontFamily !== "inherit") {
+      div.style.fontFamily = msg.fontFamily;
+    }
+    content.appendChild(div);
+  }
+
+  /* ---- Zoom and pan ------------------------------------------------------ */
+
+  var scale = 1, panX = 0, panY = 0;
+  var MIN_SCALE = 0.25, MAX_SCALE = 12;
+
+  function applyTransform() {
+    content.style.transform =
+      "translate(" + panX + "px," + panY + "px) scale(" + scale + ")";
+  }
+
+  function resetView() {
+    scale = 1; panX = 0; panY = 0;
+    applyTransform();
+  }
+
+  function zoomAt(cx, cy, factor) {
+    var next = Math.min(MAX_SCALE, Math.max(MIN_SCALE, scale * factor));
+    factor = next / scale;
+    if (factor === 1) return;
+    // Keep the point under the cursor fixed while scaling.
+    var rect = stage.getBoundingClientRect();
+    var ox = cx - rect.left - rect.width / 2;
+    var oy = cy - rect.top - rect.height / 2;
+    panX = ox - (ox - panX) * factor;
+    panY = oy - (oy - panY) * factor;
+    scale = next;
+    applyTransform();
+  }
+
+  stage.addEventListener("wheel", function (e) {
+    e.preventDefault();
+    zoomAt(e.clientX, e.clientY, e.deltaY < 0 ? 1.15 : 1 / 1.15);
+  }, { passive: false });
+
+  stage.addEventListener("dblclick", resetView);
+
+  // Pointer events cover mouse drag and one or two finger touch. Two active
+  // pointers become a pinch; the pair's midpoint also pans.
+  var pointers = new Map();
+  var pinchStart = null;
+
+  stage.addEventListener("pointerdown", function (e) {
+    stage.setPointerCapture(e.pointerId);
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (pointers.size === 1) stage.classList.add("dragging");
+    if (pointers.size === 2) pinchStart = null; // recalibrate on next move
+  });
+
+  stage.addEventListener("pointermove", function (e) {
+    var p = pointers.get(e.pointerId);
+    if (!p) return;
+
+    if (pointers.size === 1) {
+      panX += e.clientX - p.x;
+      panY += e.clientY - p.y;
+      applyTransform();
+    } else if (pointers.size === 2) {
+      p.x = e.clientX; p.y = e.clientY;
+      var pts = Array.from(pointers.values());
+      var dist = Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y);
+      var midX = (pts[0].x + pts[1].x) / 2;
+      var midY = (pts[0].y + pts[1].y) / 2;
+      if (pinchStart) {
+        zoomAt(midX, midY, dist / pinchStart.dist);
+        panX += midX - pinchStart.midX;
+        panY += midY - pinchStart.midY;
+        applyTransform();
+      }
+      pinchStart = { dist: dist, midX: midX, midY: midY };
+      return;
+    }
+    p.x = e.clientX; p.y = e.clientY;
+  });
+
+  function endPointer(e) {
+    pointers.delete(e.pointerId);
+    pinchStart = null;
+    if (!pointers.size) stage.classList.remove("dragging");
+  }
+  stage.addEventListener("pointerup", endPointer);
+  stage.addEventListener("pointercancel", endPointer);
+
+  /* ---- Go ---------------------------------------------------------------- */
+
+  connect();
+})();
+</script>
+</body>
+</html>
