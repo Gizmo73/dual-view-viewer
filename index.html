@@ -321,6 +321,16 @@
   function onData(msg) {
     if (!msg || typeof msg !== "object") return;
 
+    if (msg.k === "clear") {
+      incoming = null;
+      setProgress(null);
+      clearContent();
+      stage.style.background = "";
+      idle.classList.remove("hidden");
+      idleMsg.textContent = "The table is between scenes. This page will update when the DM sends something.";
+      return;
+    }
+
     if (msg.k === "text") {
       incoming = null;
       setProgress(null);
