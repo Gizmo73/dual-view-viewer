@@ -58,3 +58,27 @@ it reopens there from then on.
   available as a command.
 - **Background colour**: shown behind the image (letterboxing).
 - **Remember window position**: on by default.
+
+## Players (remote viewer)
+
+Everything you send can also be mirrored to players in their own browser,
+with one link covering the main screen, the ambient screen and your Owlbear
+Rodeo room.
+
+1. In settings, set **Viewer page URL** (where this repo's `index.html` is
+   hosted) and, optionally, **Owlbear Rodeo URL**.
+2. At the start of a session, press **New player link** at the top of the
+   controller (or run the "New player link" command). It opens a fresh room
+   and copies the link; paste it to your players.
+3. Players open the link in a desktop browser. The page shows your main
+   screen, with buttons to open Owlbear Rodeo and the ambient screen (in its
+   own window, ready to drag onto a second monitor).
+
+**Copy current link** re-sends the same link without disconnecting anyone.
+The controller's Players section shows whether the room is online and how
+many players are on each screen.
+
+## Controller
+
+The controller tab has three fixed sections: **Players**, **Main screen** and
+**Ambient screen**. Each screen's buttons only ever drive that screen.

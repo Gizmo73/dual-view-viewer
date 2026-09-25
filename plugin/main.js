@@ -8,6 +8,7 @@ const {
   FileSystemAdapter,
   TFile,
   Menu,
+  Modal,
   Notice,
   debounce,
 } = require("obsidian");
@@ -24,16 +25,18 @@ const DEFAULTS = {
   fontFamily: "inherit", // "inherit" picks up Obsidian's own current theme font
   presets: {},            // name -> { backgroundColor, textColor, fontFamily }
   hosts: {},
-  broadcast: true,        // mirror popout content to the remote viewer page
-  broadcastRoomId: "",    // generated once on first load, unguessable
-  viewerBaseUrl: "",      // where viewer.html is hosted, e.g. a GitHub Pages URL
+  broadcast: true,        // run the player room at all (main screen always mirrors)
+  broadcastRoomId: "",    // the player room; "New player link" replaces it
+  viewerBaseUrl: "",      // where the viewer page is hosted, e.g. a GitHub Pages URL
+  owlbearUrl: "",         // Owlbear Rodeo room, offered to players as a button
   ambient: {}             // ambient window's own settings bag, filled by AMBIENT_DEFAULTS
 };
 
-// The ambient window is fully independent of the main one: its own look,
-// its own saved position, and its own remote room. It shares only the viewer
-// page URL and the global presets. Defaults lean toward an upright second
-// screen (single view, landscape orientation renders single upright).
+// The ambient window is independent of the main one: its own look and its
+// own saved position. It shares the player room (players pick the ambient
+// screen from the viewer page) and the global presets. Defaults lean toward
+// an upright second screen (single view, landscape orientation renders
+// single upright).
 const AMBIENT_DEFAULTS = {
   swap: false,
   orientation: "landscape",
@@ -42,8 +45,7 @@ const AMBIENT_DEFAULTS = {
   textColor: "#ffffff",
   fontFamily: "inherit",
   hosts: {},
-  broadcast: true,
-  broadcastRoomId: ""
+  broadcast: true         // mirror the ambient screen to players
 };
 
 // Curated font choices. "inherit" pulls whatever font Obsidian's own theme
@@ -96,6 +98,11 @@ const STYLE = `
 /* (not the popout) since this plugin doesn't rely on a separate styles.css */
 const CONTROLLER_STYLE = `
 .dual-view-controller { padding: 12px; display: flex; flex-direction: column; gap: 12px; }
+.dual-view-controller__section { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border: 1px solid var(--background-modifier-border); border-left-width: 4px; border-radius: 8px; }
+.dual-view-controller__section--players { border-left-color: var(--text-faint); }
+.dual-view-controller__section--main { border-left-color: var(--interactive-accent); }
+.dual-view-controller__section--ambient { border-left-color: var(--color-orange, #e0a040); }
+.dual-view-controller__heading { margin: 0; font-size: 0.8em; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-muted); }
 .dual-view-controller__tabs { display: flex; flex-wrap: wrap; gap: 6px; }
 .dual-view-controller__tab { display: flex; align-items: stretch; border: 1px solid var(--background-modifier-border); border-radius: 6px; overflow: hidden; }
 .dual-view-controller__tab.is-active { border-color: var(--interactive-accent); }
@@ -117,43 +124,57 @@ function isImage(file) {
 }
 
 /* Remote viewer broadcast. --------------------------------------------------
-   One PeerJS peer registered under a fixed room ID from settings. The remote
-   player opens the static viewer page with that ID in the URL; content is
-   pushed over a WebRTC data channel, so nothing is hosted or stored anywhere.
-   PeerJS is pulled from a CDN at runtime rather than vendored, since
-   broadcasting is only meaningful when online anyway. */
+   One PeerJS peer, registered under the room ID from settings, serves both
+   screens. Each player tab says which screen it wants ("main" or "ambient")
+   when it connects, so a single link covers everything: the viewer page opens
+   its own ambient window against the same room. Content is pushed over
+   WebRTC data channels, so nothing is hosted or stored anywhere. PeerJS is
+   pulled from a CDN at runtime rather than vendored, since broadcasting is
+   only meaningful when online anyway. */
 
-const PEERJS_SRC = "https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js";
+const PEERJS_SRCS = [
+  "https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js",
+  "https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js",
+];
 
-// Injects the PeerJS <script> exactly once for the whole plugin, shared across
-// every broadcaster. This guard is deliberately module-level, not per-instance:
-// the main and ambient broadcasters both call it from start() in the same tick,
-// and a per-instance guard let each append its own tag. Loading the bundle twice
-// re-evaluates PeerJS's Parcel runtime and clobbers the first peer already built
-// against it, which takes down BOTH rooms at once. Resolves false rather than
-// throwing if the CDN is unreachable, so an offline vault just loses broadcast.
+// Injects the PeerJS <script> exactly once for the whole plugin. Loading the
+// bundle twice re-evaluates PeerJS's Parcel runtime and clobbers any peer
+// already built against it. Tries each CDN in turn, and resolves false rather
+// than throwing if none load, so an offline vault just loses broadcast.
 let peerJsLoadPromise = null;
 function loadPeerJsOnce() {
   if (window.Peer) return Promise.resolve(true);
   if (peerJsLoadPromise) return peerJsLoadPromise;
-  peerJsLoadPromise = new Promise((resolve) => {
+  const tryLoad = (i) => new Promise((resolve) => {
+    if (i >= PEERJS_SRCS.length) { resolve(false); return; }
     const s = document.createElement("script");
-    s.src = PEERJS_SRC;
-    s.onload = () => resolve(true);
-    s.onerror = () => { peerJsLoadPromise = null; resolve(false); };
+    s.src = PEERJS_SRCS[i];
+    s.onload = () => resolve(!!window.Peer);
+    s.onerror = () => { s.remove(); resolve(tryLoad(i + 1)); };
     document.head.appendChild(s);
+  });
+  peerJsLoadPromise = tryLoad(0).then((ok) => {
+    if (!ok) peerJsLoadPromise = null; // let a later attempt try again
+    return ok;
   });
   return peerJsLoadPromise;
 }
 
-// Safe cross-browser data channel message size. Images are chunked at this
-// size by hand rather than trusting PeerJS's own chunking, so a failure mode
-// on the player's end is never a mystery.
-const BROADCAST_CHUNK = 16 * 1024;
+// Images are chunked by hand so a failure on the player's end is never a
+// mystery. 16000 keeps each packed chunk (bytes plus its small header) under
+// PeerJS's own 16300-byte limit, so PeerJS never splits it a second time.
+const BROADCAST_CHUNK = 16000;
 
 // Keep at most this much queued in the channel before pausing the send loop.
 // Chrome throws once the buffer passes ~16MB, so back off well before that.
 const BROADCAST_BUFFER_CAP = 4 * 1024 * 1024;
+
+// Both ends ping every HEARTBEAT_MS, and a link silent for DEAD_MS is treated
+// as gone. PeerJS never reports a data channel that dies with a sleeping
+// laptop or dropped wifi, it just goes quiet, so without this a dead player
+// lingers as "connected" forever.
+const HEARTBEAT_MS = 10000;
+const DEAD_MS = 35000;
 
 function mimeForExtension(ext) {
   const map = {
@@ -171,78 +192,261 @@ function makeRoomId() {
   return "dv-" + hex;
 }
 
-class RemoteBroadcaster {
-  constructor(plugin, config, label) {
+// Owns the one peer and every player connection, and keeps the room alive.
+// Recovery prefers peer.reconnect(): it reuses the same broker token, so the
+// broker hands the room back even if it hasn't noticed the old socket died,
+// and every player's open data channel survives. Tearing the peer down and
+// registering the ID afresh is the last resort, because a fresh peer is
+// refused ("unavailable-id") for as long as the broker still holds the old
+// registration.
+class RemoteHub {
+  constructor(plugin) {
     this.plugin = plugin;
-    this.config = config || plugin.settings;   // which settings bag to read
-    this.label = label || "Dual View";         // used in user-facing notices
     this.peer = null;
-    this.conns = new Set();
-    this.last = null;        // last payload, resent to late joiners and refreshes
-    this.transferId = 0;     // bumps on every send; stale image sends abort themselves
+    this.conns = new Set();   // open connections; conn._dvView is "main" or "ambient"
+    this.channels = {};       // view -> RemoteChannel
+    this.state = "off";       // off | connecting | online | reconnecting
+    this.wanted = false;      // between start() and stop()
     this.destroyed = false;
-    this._retry = null;
+    this._loading = false;
+    this._peerStartedAt = 0;
+    this._failures = 0;       // consecutive broker failures; drives the backoff
+    this._idTaken = 0;
+    this._healTimer = null;
+    this._tick = null;
+  }
+
+  channel(view, config) {
+    const ch = new RemoteChannel(this, view, config);
+    this.channels[view] = ch;
+    return ch;
+  }
+
+  playerCount(view) {
+    let n = 0;
+    for (const c of this.conns) if (c._dvView === view) n += 1;
+    return n;
+  }
+
+  setState(state) {
+    if (this.state === state) return;
+    this.state = state;
+    this.plugin.refreshControllerStatus();
+  }
+
+  syncState() {
+    const p = this.peer;
+    if (!this.wanted) this.setState("off");
+    else if (p && p.open) this.setState("online");
+    else if (!p || p.destroyed || p.disconnected) this.setState("reconnecting");
+    else this.setState("connecting");
   }
 
   async start() {
-    if (this.peer || this.destroyed) return;
-    const ok = await loadPeerJsOnce();
     if (this.destroyed) return;
+    this.wanted = true;
+    if (!this._tick) this._tick = window.setInterval(() => this.tick(), HEARTBEAT_MS);
+    if (this.peer && this.peer.destroyed) this.peer = null;
+    if (this.peer || this._loading) return;
+    if (this.state === "off") this.setState("connecting");
+    this._loading = true;
+    const ok = await loadPeerJsOnce();
+    this._loading = false;
+    if (!this.wanted || this.destroyed || this.peer) return;
     if (!ok || !window.Peer) {
-      new Notice(this.label + ": couldn't load PeerJS (offline?). Remote broadcast unavailable.", 6000);
+      if (this._failures === 0) {
+        new Notice("Dual View: couldn't load PeerJS (offline?). Will keep retrying.", 6000);
+      }
+      this.setState("reconnecting");
+      this.scheduleHeal();
       return;
     }
-    this.peer = new window.Peer(this.config.broadcastRoomId);
-    this.peer.on("connection", (conn) => this.handleConnection(conn));
-    // "disconnected" means the broker link dropped, not the viewers. Existing
-    // data channels keep working, but nobody new can join until we reconnect.
-    this.peer.on("disconnected", () => {
-      if (!this.destroyed && this.peer && !this.peer.destroyed) {
-        try { this.peer.reconnect(); } catch (e) {}
-      }
+    this.openPeer();
+  }
+
+  openPeer() {
+    const peer = new window.Peer(this.plugin.settings.broadcastRoomId);
+    this.peer = peer;
+    this._peerStartedAt = Date.now();
+    this.syncState();
+    peer.on("open", () => {
+      if (peer !== this.peer) return;
+      this._failures = 0;
+      this._idTaken = 0;
+      this.syncState();
     });
-    this.peer.on("error", (err) => {
+    peer.on("connection", (conn) => {
+      if (peer === this.peer) this.handleConnection(conn);
+    });
+    // The broker link dropped. Players already connected keep receiving;
+    // only new joins need the broker, so heal it in the background.
+    peer.on("disconnected", () => {
+      if (peer !== this.peer) return;
+      this.syncState();
+      this.scheduleHeal();
+    });
+    peer.on("error", (err) => {
+      if (peer !== this.peer) return;
       const type = err && err.type;
+      // Errors from one player's WebRTC setup land here too. They don't
+      // affect the room, and that player's own page retries.
+      if (type === "peer-unavailable" || type === "webrtc") return;
       if (type === "unavailable-id") {
-        new Notice(this.label + ": broadcast ID already in use (a second Obsidian instance?). Regenerate it in settings.", 8000);
-      } else if (type === "network" || type === "server-error" || type === "socket-error" || type === "socket-closed") {
-        this.scheduleRestart();
+        // Almost always the broker still holding this room from a link that
+        // died uncleanly. It lets go after a minute or so; keep retrying.
+        this._idTaken += 1;
+        if (this._idTaken === 3) {
+          new Notice("Dual View: the player room is still held from an earlier connection. Still retrying; \"New player link\" starts a fresh room straight away.", 10000);
+        }
       }
-      // Per-connection errors ("peer-unavailable" etc.) are non-fatal; ignored.
+      this.syncState();
+      this.scheduleHeal();
     });
   }
 
-  // Tears the peer down and rebuilds it after a pause. Used for broker-side
-  // trouble, where reconnect() alone isn't always enough.
-  scheduleRestart() {
-    if (this.destroyed || this._retry) return;
-    this._retry = window.setTimeout(() => {
-      this._retry = null;
-      this.stop();
+  scheduleHeal() {
+    if (this._healTimer || !this.wanted || this.destroyed) return;
+    // 2s, 4s, 8s, 16s, then every 30s.
+    const delay = Math.min(30000, 2000 * Math.pow(2, this._failures));
+    this._healTimer = window.setTimeout(() => this.heal(), delay);
+  }
+
+  heal() {
+    this._healTimer = null;
+    if (!this.wanted || this.destroyed) return;
+    const p = this.peer;
+    // Healthy, or still registering: nothing to do.
+    if (p && !p.destroyed && !p.disconnected) { this.syncState(); return; }
+    this._failures += 1;
+    // Keep reconnecting while players are connected, since a rebuild would
+    // cut them off; with nobody connected, rebuild after a few failures.
+    if (p && !p.destroyed && (this._failures <= 3 || this.conns.size)) {
+      try { p.reconnect(); this.syncState(); return; } catch (e) {}
+    }
+    this.peer = null;
+    if (p) { try { p.destroy(); } catch (e) {} }
+    this.start();
+  }
+
+  // Heartbeat plus watchdog. Pings every player, drops ones that have gone
+  // silent, and restarts the room if it is down with no recovery pending.
+  tick() {
+    const now = Date.now();
+    for (const conn of this.conns) {
+      // Only players that ping are held to the heartbeat, so an older cached
+      // viewer page that never pings isn't cut off every 35 seconds.
+      if (!conn.open || (conn._dvPings && now - conn._dvSeen > DEAD_MS)) {
+        try { conn.close(); } catch (e) {}
+        this.drop(conn);
+        continue;
+      }
+      try { conn.send({ k: "ping" }); } catch (e) {}
+    }
+    if (!this.wanted || this.destroyed || this._healTimer || this._loading) return;
+    const p = this.peer;
+    if (!p || p.destroyed || p.disconnected) {
+      this.scheduleHeal();
+    } else if (!p.open && now - this._peerStartedAt > 30000) {
+      // Stuck registering with the broker. Start over.
+      this.peer = null;
+      try { p.destroy(); } catch (e) {}
       this.start();
-    }, 10000);
+    }
   }
 
   handleConnection(conn) {
+    const view = conn.metadata && conn.metadata.view === "ambient" ? "ambient" : "main";
+    let opened = false;
     conn.on("open", () => {
+      opened = true;
+      conn._dvView = view;
+      conn._dvSeen = Date.now();
+      conn._dvPings = false;
       this.conns.add(conn);
-      new Notice(this.label + ": remote viewer connected.", 2500);
-      if (this.last) this.sendTo(conn, this.last);
+      new Notice("Dual View: player connected (" + view + ").", 2500);
+      this.plugin.refreshControllerStatus();
+      this.sendHello(conn);
+      const ch = this.channels[view];
+      if (ch && ch.last) ch.sendTo(conn, ch.last);
     });
-    const drop = () => {
-      if (this.conns.delete(conn)) {
-        new Notice(this.label + ": remote viewer disconnected.", 2500);
-      }
-    };
-    conn.on("close", drop);
-    conn.on("error", drop);
+    conn.on("data", (msg) => {
+      conn._dvSeen = Date.now();
+      if (msg && msg.k === "ping") conn._dvPings = true;
+    });
+    conn.on("close", () => this.drop(conn));
+    conn.on("error", () => this.drop(conn));
+    // A connection whose WebRTC setup stalls fires neither open nor close.
+    // Close it so it doesn't hold a peer connection open forever.
+    window.setTimeout(() => {
+      if (!opened) { try { conn.close(); } catch (e) {} }
+    }, 20000);
+  }
+
+  drop(conn) {
+    if (!this.conns.delete(conn)) return;
+    new Notice("Dual View: player disconnected (" + conn._dvView + ").", 2500);
+    this.plugin.refreshControllerStatus();
+  }
+
+  // Tells a player which screen it's on and where the map lives. Sent on
+  // connect, and again to everyone when the Owlbear link changes.
+  sendHello(conn) {
+    try {
+      conn.send({ k: "hello", view: conn._dvView, owlbear: this.plugin.settings.owlbearUrl || "" });
+    } catch (e) {}
+  }
+
+  helloAll() {
+    for (const conn of this.conns) this.sendHello(conn);
+  }
+
+  // Closes the peer but leaves the hub reusable (settings toggle, new room).
+  stop() {
+    this.wanted = false;
+    if (this._healTimer) { window.clearTimeout(this._healTimer); this._healTimer = null; }
+    if (this._tick) { window.clearInterval(this._tick); this._tick = null; }
+    const p = this.peer;
+    this.peer = null;
+    if (p) { try { p.destroy(); } catch (e) {} }
+    this.conns.clear();
+    this._failures = 0;
+    this._idTaken = 0;
+    this.setState("off");
+  }
+
+  restart() {
+    this.stop();
+    if (this.plugin.settings.broadcast) this.start();
+  }
+
+  destroy() {
+    this.destroyed = true;
+    this.stop();
+  }
+}
+
+// One screen's worth of broadcast: what that screen last showed, pushed to
+// the players watching it. The main and ambient windows each hold one.
+class RemoteChannel {
+  constructor(hub, view, config) {
+    this.hub = hub;
+    this.view = view;
+    this.config = config;    // settings bag for this screen's colours and broadcast flag
+    this.last = null;        // last payload, resent to late joiners and refreshes
+    this.transferId = 0;     // bumps on every send; stale image sends abort themselves
+  }
+
+  targets() {
+    const out = [];
+    for (const conn of this.hub.conns) if (conn._dvView === this.view) out.push(conn);
+    return out;
   }
 
   async broadcastImage(file) {
     if (!this.config.broadcast) return;
     let buf;
     try {
-      buf = await this.plugin.app.vault.readBinary(file);
+      buf = await this.hub.plugin.app.vault.readBinary(file);
     } catch (e) {
       return;
     }
@@ -274,7 +478,7 @@ class RemoteBroadcaster {
   }
 
   sendAll() {
-    for (const conn of this.conns) this.sendTo(conn, this.last);
+    for (const conn of this.targets()) this.sendTo(conn, this.last);
   }
 
   // Pushes one payload down one connection. Text goes as a single message;
@@ -312,7 +516,7 @@ class RemoteBroadcaster {
         ) {
           await new Promise((r) => setTimeout(r, 50));
         }
-        // A newer send superseded this one, or the viewer left. Stop quietly;
+        // A newer send superseded this one, or the player left. Stop quietly;
         // the viewer discards partial transfers on its own.
         if (!conn.open || payload.id !== this.transferId) return;
         conn.send({
@@ -326,42 +530,48 @@ class RemoteBroadcaster {
     } catch (e) {}
   }
 
-  // Blanks every connected viewer and forgets the last payload, so neither
-  // current nor late-joining viewers keep seeing content the table has
+  // Pushes this screen's current colours and font to its players without
+  // resending the content, and keeps the stored payload in step so late
+  // joiners get the same.
+  refreshStyle() {
+    const s = this.config;
+    if (this.last) {
+      this.last.backgroundColor = s.backgroundColor;
+      if (this.last.kind === "text") {
+        this.last.textColor = s.textColor;
+        this.last.fontFamily = s.fontFamily;
+      }
+    }
+    if (!s.broadcast) return;
+    const msg = {
+      k: "style",
+      backgroundColor: s.backgroundColor,
+      textColor: s.textColor,
+      fontFamily: s.fontFamily,
+    };
+    for (const conn of this.targets()) {
+      try { conn.send(msg); } catch (e) {}
+    }
+  }
+
+  // Blanks this screen's players and forgets the last payload, so neither
+  // current nor late-joining players keep seeing content the table has
   // closed. Bumping transferId also aborts any in-flight image send.
   clearRemote() {
     this.transferId += 1;
     this.last = null;
-    for (const conn of this.conns) {
+    for (const conn of this.targets()) {
       try { conn.send({ k: "clear" }); } catch (e) {}
     }
-  }
-
-  // Closes the peer but leaves the broadcaster reusable (settings toggle).
-  stop() {
-    if (this._retry) {
-      window.clearTimeout(this._retry);
-      this._retry = null;
-    }
-    if (this.peer) {
-      try { this.peer.destroy(); } catch (e) {}
-    }
-    this.peer = null;
-    this.conns.clear();
-  }
-
-  destroy() {
-    this.destroyed = true;
-    this.stop();
   }
 }
 
 /* Owns one popout window and renders the dual rotated view inside it. ------ */
 class DualWindow {
-  constructor(plugin, config, broadcaster) {
+  constructor(plugin, config, remote) {
     this.plugin = plugin;
     this.config = config || plugin.settings;   // this window's own settings bag
-    this.broadcaster = broadcaster || null;    // this window's own remote broadcaster
+    this.remote = remote || null;              // this window's RemoteChannel
     this.leaf = null;
     this.container = null;   // WorkspaceWindow (electron window + rootEl)
     this.doc = null;
@@ -415,7 +625,6 @@ class DualWindow {
     this.container = this.leaf.getContainer();
     this.doc = this.container?.win?.document || this.leaf.view?.containerEl?.ownerDocument;
     this.popup = this.container?.win || this.doc?.defaultView;
-    this.popup = this.doc.defaultView;
 
     // Make sure the popout document carries our (current) styles.
     if (this.doc) {
@@ -447,11 +656,8 @@ class DualWindow {
       ew.on("leave-full-screen", save);
       ew.on("close", () => this.cleanup());
     }
-    this.plugin.registerEvent(
-      app.workspace.on("window-close", (w) => {
-        if (w === this.container) this.cleanup();
-      })
-    );
+    // Obsidian's own window-close event is handled once, in the plugin's
+    // onload, rather than registered again every time a popout opens.
 
     // Only ever meant to catch Obsidian's async image-src assignment.
     // Gated on contentKind so a leftover (hidden) real <img> from an
@@ -507,7 +713,7 @@ class DualWindow {
 
     // Mirror to the remote viewer. Fire and forget; a slow or absent viewer
     // must never hold up the table.
-    if (this.broadcaster) this.broadcaster.broadcastImage(file);
+    if (this.remote) this.remote.broadcastImage(file);
   }
 
   connectObserver() {
@@ -617,7 +823,7 @@ class DualWindow {
     this.popup.setTimeout(() => this.applyText(), 60);
 
     // Mirror to the remote viewer, same as loadFile().
-    if (this.broadcaster) this.broadcaster.broadcastText(text);
+    if (this.remote) this.remote.broadcastText(text);
   }
 
   // The element our overlay should attach to. getViewContent() only matches
@@ -892,6 +1098,8 @@ class DualWindow {
     if (overlay) this.applySplit(overlay);
     this.relayout();
   }
+  // The refresh* methods restyle the popout live and push the same change
+  // to players, so remote colours no longer wait for the next send.
   refreshBackground() {
     const vc = this.contentHost();
     const overlay = vc && vc.querySelector(":scope > .drm-overlay");
@@ -902,6 +1110,7 @@ class DualWindow {
         this.config.backgroundColor
       );
     }
+    if (this.remote) this.remote.refreshStyle();
   }
   refreshTextColor() {
     const vc = this.contentHost();
@@ -909,6 +1118,7 @@ class DualWindow {
     if (overlay) {
       overlay.style.setProperty("--dual-view-text-color", this.config.textColor);
     }
+    if (this.remote) this.remote.refreshStyle();
   }
   refreshFont() {
     const vc = this.contentHost();
@@ -916,6 +1126,7 @@ class DualWindow {
     if (overlay) {
       overlay.style.setProperty("--dual-view-font", this.config.fontFamily);
     }
+    if (this.remote) this.remote.refreshStyle();
     // A font swap changes how much space the text needs, so re-fit it.
     this.relayout();
   }
@@ -941,7 +1152,7 @@ class DualWindow {
   cleanup() {
     // The popout is gone, however that happened (close button, window X,
     // window-close event), so the remote shouldn't keep showing its content.
-    if (this.broadcaster) this.broadcaster.clearRemote();
+    if (this.remote) this.remote.clearRemote();
     if (this.observer) this.observer.disconnect();
     if (this.popup) {
       try { this.popup.removeEventListener("resize", this.boundSize); } catch (e) {}
@@ -982,16 +1193,46 @@ class DualWindow {
   }
 }
 
-// Docked tab in the main window: one sub-tab per sent image/text item, plus
-// quick access to the swap/orientation/background toggles that used to live
-// only in Settings. Session-only — nothing here is persisted to disk.
+// Simple yes/no prompt, used before anything that would cut players off.
+// Calls onResult(true) on confirm, onResult(false) however else it closes.
+class ConfirmModal extends Modal {
+  constructor(app, message, cta, onResult) {
+    super(app);
+    this.message = message;
+    this.cta = cta;
+    this.onResult = onResult;
+    this.confirmed = false;
+  }
+
+  onOpen() {
+    this.contentEl.createEl("p", { text: this.message });
+    new Setting(this.contentEl)
+      .addButton((b) => b.setButtonText("Cancel").onClick(() => this.close()))
+      .addButton((b) =>
+        b.setButtonText(this.cta).setCta().onClick(() => {
+          this.confirmed = true;
+          this.close();
+        })
+      );
+  }
+
+  onClose() {
+    this.contentEl.empty();
+    this.onResult(this.confirmed);
+  }
+}
+
+// Docked tab in the main window, in three fixed sections: the player link,
+// the main screen (one sub-tab per sent image/text item plus its look), and
+// the ambient screen. Each screen's buttons only ever drive that screen, so
+// there's no hidden "which window am I controlling" mode to trip over.
+// Session-only: nothing here is persisted except the settings it edits.
 class DualViewController extends ItemView {
   constructor(leaf, plugin) {
     super(leaf);
     this.plugin = plugin;
-    this.tabsEl = null;
-    this.statusEl = null;
-    this.controlsEl = null;
+    this.opened = false;
+    this.linkStatusEl = null;
   }
 
   getViewType() { return VIEW_TYPE_CONTROLLER; }
@@ -999,63 +1240,144 @@ class DualViewController extends ItemView {
   getIcon() { return "layout-dashboard"; }
 
   async onOpen() {
-    this.contentEl.empty();
+    this.opened = true;
     this.contentEl.addClass("dual-view-controller");
-    this.tabsEl = this.contentEl.createDiv({ cls: "dual-view-controller__tabs" });
-    this.statusEl = this.contentEl.createDiv({ cls: "dual-view-controller__status" });
-    this.controlsEl = this.contentEl.createDiv({ cls: "dual-view-controller__controls" });
     this.render();
   }
 
   onClose() {
+    this.opened = false;
+    this.linkStatusEl = null;
     return Promise.resolve();
   }
 
-  // Rebuilds the tab strip and control buttons from current plugin state.
-  // Cheap enough to call after every change rather than diffing.
+  // Rebuilds everything from current plugin state. Cheap enough to call
+  // after every change rather than diffing.
   render() {
-    if (!this.tabsEl) return;
-    const plugin = this.plugin;
+    if (!this.opened) return;
+    const root = this.contentEl;
+    root.empty();
+    this.renderPlayers(root);
+    this.renderMain(root);
+    this.renderAmbient(root);
+  }
 
-    this.tabsEl.empty();
+  section(parent, title, kind) {
+    const el = parent.createDiv({
+      cls: "dual-view-controller__section dual-view-controller__section--" + kind,
+    });
+    el.createEl("h4", { cls: "dual-view-controller__heading", text: title });
+    return el;
+  }
+
+  renderPlayers(root) {
+    const plugin = this.plugin;
+    const sec = this.section(root, "Players", "players");
+    const row = sec.createDiv({ cls: "dual-view-controller__row" });
+    const newBtn = row.createEl("button", { cls: "mod-cta", text: "New player link" });
+    newBtn.title = "Starts a fresh room and copies its link. Anyone on the old link is disconnected.";
+    newBtn.onclick = () => plugin.newPlayerLink();
+    const copyBtn = row.createEl("button", { text: "Copy current link" });
+    copyBtn.onclick = () => plugin.copyPlayerLink();
+    this.linkStatusEl = sec.createDiv({ cls: "dual-view-controller__status" });
+    this.updateLinkStatus();
+  }
+
+  // Updated in place as players come and go, so a colour picker mid-drag
+  // isn't torn down by a full re-render.
+  updateLinkStatus() {
+    if (!this.linkStatusEl) return;
+    const plugin = this.plugin;
+    const s = plugin.settings;
+    let text;
+    if (!(s.viewerBaseUrl || "").trim()) {
+      text = "Set the viewer page URL in Dual View settings first.";
+    } else if (!s.broadcast) {
+      text = "Broadcast is off. \"New player link\" turns it on.";
+    } else {
+      const hub = plugin.hub;
+      const state = {
+        online: "Room online",
+        connecting: "Opening room…",
+        reconnecting: "Reconnecting…",
+        off: "Room closed",
+      }[hub.state] || hub.state;
+      text = state + " · " + hub.playerCount("main") + " on main, " +
+        hub.playerCount("ambient") + " on ambient";
+      if (!(s.owlbearUrl || "").trim()) text += " · no Owlbear link set";
+    }
+    this.linkStatusEl.setText(text);
+  }
+
+  renderMain(root) {
+    const plugin = this.plugin;
+    const sec = this.section(root, "Main screen", "main");
+
+    const tabs = sec.createDiv({ cls: "dual-view-controller__tabs" });
     if (!plugin.screenItems.length) {
-      this.tabsEl.createDiv({ cls: "dual-view-controller__empty", text: "Nothing sent yet." });
+      tabs.createDiv({ cls: "dual-view-controller__empty", text: "Nothing sent yet." });
     } else {
       for (const item of plugin.screenItems) {
-        const tab = this.tabsEl.createDiv({
+        const tab = tabs.createDiv({
           cls: "dual-view-controller__tab" + (item.id === plugin.currentItemId ? " is-active" : ""),
         });
         const main = tab.createEl("button", { cls: "dual-view-controller__tab-main", text: item.title });
         main.onclick = () => plugin.activateItem(item.id);
-        const close = tab.createEl("button", { cls: "dual-view-controller__tab-close", text: "\u00D7" });
+        const close = tab.createEl("button", { cls: "dual-view-controller__tab-close", text: "×" });
         close.onclick = (e) => { e.preventDefault(); e.stopPropagation(); plugin.closeItem(item.id); };
       }
     }
-
     const current = plugin.screenItems.find((i) => i.id === plugin.currentItemId);
-    this.statusEl.setText(current ? "Showing: " + current.title : "No active item.");
-
-    this.controlsEl.empty();
-
-    // Which window the controls below drive. The main tab strip above is
-    // always the main window; only this cluster follows the target.
-    const target = plugin.controlTarget === "ambient" ? "ambient" : "main";
-    const cfg = plugin.targetConfig();
-    const win = plugin.targetWindow();
-    const isAmbient = target === "ambient";
-
-    const targetRow = this.controlsEl.createDiv({ cls: "dual-view-controller__row" });
-    targetRow.createSpan({ text: "Controlling:" });
-    const mainTargetBtn = targetRow.createEl("button", {
-      text: "Main" + (!isAmbient ? " \u2713" : ""),
+    sec.createDiv({
+      cls: "dual-view-controller__status",
+      text: current ? "Showing: " + current.title : "No active item.",
     });
-    mainTargetBtn.onclick = () => { plugin.controlTarget = "main"; this.render(); };
-    const ambTargetBtn = targetRow.createEl("button", {
-      text: "Ambient" + (isAmbient ? " \u2713" : ""),
-    });
-    ambTargetBtn.onclick = () => { plugin.controlTarget = "ambient"; this.render(); };
 
-    const row = this.controlsEl.createDiv({ cls: "dual-view-controller__row" });
+    this.renderWindowControls(sec, plugin.dual, plugin.settings, false);
+
+    const saveRow = sec.createDiv({ cls: "dual-view-controller__row" });
+    const presetNameInput = saveRow.createEl("input", { attr: { type: "text", placeholder: "New preset name" } });
+    const savePresetBtn = saveRow.createEl("button", { text: "Save as preset" });
+    savePresetBtn.onclick = async () => {
+      const name = presetNameInput.value.trim();
+      if (!name) {
+        new Notice("Enter a preset name first.", 1500);
+        return;
+      }
+      const cfg = plugin.settings;
+      plugin.settings.presets[name] = {
+        backgroundColor: cfg.backgroundColor,
+        textColor: cfg.textColor,
+        fontFamily: cfg.fontFamily,
+      };
+      await plugin.saveSettings();
+      this.render();
+    };
+  }
+
+  renderAmbient(root) {
+    const plugin = this.plugin;
+    const sec = this.section(root, "Ambient screen", "ambient");
+
+    const sceneRow = sec.createDiv({ cls: "dual-view-controller__row" });
+    const sceneName = (plugin.ambient.container && plugin.ambientFile)
+      ? plugin.ambientFile.basename
+      : "none";
+    sceneRow.createSpan({ text: "Scene: " + sceneName });
+    const clearBtn = sceneRow.createEl("button", { text: "Clear scene" });
+    clearBtn.onclick = () => plugin.clearAmbient();
+
+    this.renderWindowControls(sec, plugin.ambient, plugin.settings.ambient, true);
+  }
+
+  // The buttons, colours and preset picker for one screen. Text colour and
+  // font only apply to text tabs, which never reach the image-only ambient
+  // screen, so they're main-only.
+  renderWindowControls(sec, win, cfg, isAmbient) {
+    const plugin = this.plugin;
+    const which = isAmbient ? "ambient" : "main";
+
+    const row = sec.createDiv({ cls: "dual-view-controller__row" });
 
     const swapBtn = row.createEl("button", { text: "Swap sides: " + (cfg.swap ? "On" : "Off") });
     swapBtn.onclick = async () => {
@@ -1082,32 +1404,34 @@ class DualViewController extends ItemView {
       this.render();
     };
 
-    const closeBtn = row.createEl("button", { text: "Close " + (isAmbient ? "ambient" : "main") + " window" });
-    closeBtn.onclick = () => { win.close(); if (isAmbient) plugin.ambientFile = null; this.render(); };
+    const closeBtn = row.createEl("button", { text: "Close " + which + " window" });
+    closeBtn.onclick = () => {
+      if (isAmbient) plugin.closeAmbient();
+      else win.close();
+      this.render();
+    };
 
-    const colorRow = this.controlsEl.createDiv({ cls: "dual-view-controller__row" });
+    const colorRow = sec.createDiv({ cls: "dual-view-controller__row" });
     colorRow.createSpan({ text: "Background:" });
     const colorInput = colorRow.createEl("input", { attr: { type: "color" } });
     colorInput.value = cfg.backgroundColor;
-    colorInput.oninput = async () => {
+    colorInput.oninput = () => {
       cfg.backgroundColor = colorInput.value;
-      await plugin.saveSettings();
+      plugin.saveSettingsSoon();
       win.refreshBackground();
     };
 
-    // Text colour and font only affect text tabs, which never apply to the
-    // image-only ambient window, so they're hidden when it's the target.
     if (!isAmbient) {
       colorRow.createSpan({ text: "Text:" });
       const textColorInput = colorRow.createEl("input", { attr: { type: "color" } });
       textColorInput.value = cfg.textColor;
-      textColorInput.oninput = async () => {
+      textColorInput.oninput = () => {
         cfg.textColor = textColorInput.value;
-        await plugin.saveSettings();
+        plugin.saveSettingsSoon();
         win.refreshTextColor();
       };
 
-      const fontRow = this.controlsEl.createDiv({ cls: "dual-view-controller__row" });
+      const fontRow = sec.createDiv({ cls: "dual-view-controller__row" });
       fontRow.createSpan({ text: "Font:" });
       const fontKnown = FONT_OPTIONS.some(([v]) => v === cfg.fontFamily);
       const fontSelect = fontRow.createEl("select");
@@ -1115,7 +1439,7 @@ class DualViewController extends ItemView {
         const opt = fontSelect.createEl("option", { text: label, value });
         if (fontKnown && value === cfg.fontFamily) opt.selected = true;
       }
-      const customFontOpt = fontSelect.createEl("option", { text: "Custom\u2026", value: "custom" });
+      const customFontOpt = fontSelect.createEl("option", { text: "Custom…", value: "custom" });
       if (!fontKnown) customFontOpt.selected = true;
       fontSelect.onchange = async () => {
         const value = fontSelect.value;
@@ -1131,21 +1455,20 @@ class DualViewController extends ItemView {
       if (!fontKnown) {
         const customFontInput = fontRow.createEl("input", { attr: { type: "text", placeholder: "Font name" } });
         customFontInput.value = cfg.fontFamily === "inherit" ? "" : cfg.fontFamily;
-        customFontInput.oninput = async () => {
+        customFontInput.oninput = () => {
           cfg.fontFamily = customFontInput.value.trim() || "inherit";
-          await plugin.saveSettings();
+          plugin.saveSettingsSoon();
           win.refreshFont();
         };
       }
     }
 
-    // Presets are global. Applying to the ambient target uses only the
-    // background, since it has no text to colour or font to set.
-    const presetRow = this.controlsEl.createDiv({ cls: "dual-view-controller__row" });
+    // Presets are global. On the ambient screen only the background applies.
+    const presetRow = sec.createDiv({ cls: "dual-view-controller__row" });
     presetRow.createSpan({ text: "Preset:" });
     const presetNames = Object.keys(plugin.settings.presets).sort();
     const presetSelect = presetRow.createEl("select");
-    presetSelect.createEl("option", { text: presetNames.length ? "Choose\u2026" : "No presets saved", value: "" });
+    presetSelect.createEl("option", { text: presetNames.length ? "Choose…" : "No presets saved", value: "" });
     for (const name of presetNames) {
       presetSelect.createEl("option", { text: name, value: name });
     }
@@ -1165,36 +1488,6 @@ class DualViewController extends ItemView {
       await plugin.saveSettings();
       this.render();
     };
-
-    const saveRow = this.controlsEl.createDiv({ cls: "dual-view-controller__row" });
-    const presetNameInput = saveRow.createEl("input", { attr: { type: "text", placeholder: "New preset name" } });
-    const savePresetBtn = saveRow.createEl("button", { text: "Save as preset" });
-    savePresetBtn.onclick = async () => {
-      const name = presetNameInput.value.trim();
-      if (!name) {
-        new Notice("Enter a preset name first.", 1500);
-        return;
-      }
-      plugin.settings.presets[name] = {
-        backgroundColor: cfg.backgroundColor,
-        textColor: cfg.textColor,
-        fontFamily: cfg.fontFamily,
-      };
-      await plugin.saveSettings();
-      this.render();
-    };
-
-    // Ambient-only row: what scene is up, and a way to blank it without
-    // closing the window.
-    if (isAmbient) {
-      const ambRow = this.controlsEl.createDiv({ cls: "dual-view-controller__row" });
-      const sceneName = (plugin.ambient.container && plugin.ambientFile)
-        ? plugin.ambientFile.basename
-        : "none";
-      ambRow.createSpan({ text: "Ambient scene: " + sceneName });
-      const clearBtn = ambRow.createEl("button", { text: "Clear scene" });
-      clearBtn.onclick = () => { plugin.clearAmbient(); this.render(); };
-    }
   }
 }
 
@@ -1207,23 +1500,31 @@ module.exports = class DualViewPlugin extends Plugin {
     this.screenItems = [];
     this.currentItemId = null;
 
-    // Which window the controller's control cluster drives. Session-only.
-    this.controlTarget = "main";
     // The image currently on the ambient screen, for the controller label.
     this.ambientFile = null;
 
+    // For colour pickers and other rapid-fire inputs: one disk write once
+    // the input settles, not one per tick of the drag.
+    this.saveSettingsSoon = debounce(() => this.saveSettings(), 500, true);
+
     this.registerView(VIEW_TYPE_CONTROLLER, (leaf) => new DualViewController(leaf, this));
 
-    // Two independent broadcasters and two independent windows: the main pair
-    // reads the top-level settings and existing room (unchanged behaviour),
-    // the ambient pair reads settings.ambient and its own room. Broadcasters
-    // are built first so each window can hold its own reference.
-    this.broadcaster = new RemoteBroadcaster(this, this.settings, "Dual View");
-    this.ambientBroadcaster = new RemoteBroadcaster(this, this.settings.ambient, "Ambient");
-    this.dual = new DualWindow(this, this.settings, this.broadcaster);
-    this.ambient = new DualWindow(this, this.settings.ambient, this.ambientBroadcaster);
+    // One player room for both windows. Each window gets its own channel,
+    // reading its own settings bag, so the main and ambient screens stay
+    // independent while players need only one link.
+    this.hub = new RemoteHub(this);
+    this.dual = new DualWindow(this, this.settings, this.hub.channel("main", this.settings));
+    this.ambient = new DualWindow(this, this.settings.ambient, this.hub.channel("ambient", this.settings.ambient));
     // Ambient scene art defaults to a single upright image, not the split.
     this.ambient.mode = "single";
+
+    this.registerEvent(
+      this.app.workspace.on("window-close", (w) => {
+        for (const win of [this.dual, this.ambient]) {
+          if (w === win.container) win.cleanup();
+        }
+      })
+    );
 
     const styleEl = document.createElement("style");
     styleEl.id = "dual-view-controller-style";
@@ -1376,37 +1677,31 @@ module.exports = class DualViewPlugin extends Plugin {
 
     this.addSettingTab(new DualViewSettings(this.app, this));
 
-    // Remote viewer broadcast. Deferred to layout-ready so a slow CDN or
-    // broker handshake can't drag out Obsidian's startup. Broadcasters were
-    // constructed at the top of onload; here we only start them.
+    // Player room. Deferred to layout-ready so a slow CDN or broker
+    // handshake can't drag out Obsidian's startup.
     if (this.settings.broadcast) {
-      this.app.workspace.onLayoutReady(() => this.broadcaster.start());
-    }
-    if (this.settings.ambient.broadcast) {
-      this.app.workspace.onLayoutReady(() => this.ambientBroadcaster.start());
+      this.app.workspace.onLayoutReady(() => this.hub.start());
     }
 
     this.addCommand({
       id: "clear-remote-viewer",
       name: "Clear remote viewer",
       callback: () => {
-        this.broadcaster.clearRemote();
+        this.dual.remote.clearRemote();
         new Notice("Remote viewer cleared.", 2000);
       },
     });
 
     this.addCommand({
       id: "copy-remote-viewer-link",
-      name: "Copy remote viewer link",
-      callback: () => {
-        const url = this.viewerLink();
-        if (!url) {
-          new Notice("Set the viewer page URL in Dual View settings first.", 4000);
-          return;
-        }
-        navigator.clipboard.writeText(url);
-        new Notice("Remote viewer link copied.", 2000);
-      },
+      name: "Copy player link",
+      callback: () => this.copyPlayerLink(),
+    });
+
+    this.addCommand({
+      id: "new-player-link",
+      name: "New player link (copies it)",
+      callback: () => this.newPlayerLink(),
     });
 
     this.addCommand({
@@ -1431,43 +1726,60 @@ module.exports = class DualViewPlugin extends Plugin {
       name: "Close ambient window",
       callback: () => this.closeAmbient(),
     });
-
-    this.addCommand({
-      id: "copy-ambient-viewer-link",
-      name: "Copy ambient remote link",
-      callback: () => {
-        const url = this.ambientViewerLink();
-        if (!url) {
-          new Notice("Set the viewer page URL in Dual View settings first.", 4000);
-          return;
-        }
-        navigator.clipboard.writeText(url);
-        new Notice("Ambient remote link copied.", 2000);
-      },
-    });
   }
 
-  // The full link the remote player opens: hosted page plus room ID.
+  // The one link players open: the hosted viewer page plus this session's
+  // room. The Owlbear Rodeo room rides along so its button works even before
+  // the room connects. The viewer page opens the ambient screen itself.
   viewerLink() {
     const base = (this.settings.viewerBaseUrl || "").trim();
     if (!base) return null;
-    return base + (base.includes("?") ? "&" : "?") + "room=" + this.settings.broadcastRoomId;
+    let url = base + (base.includes("?") ? "&" : "?") +
+      "room=" + encodeURIComponent(this.settings.broadcastRoomId);
+    const owlbear = (this.settings.owlbearUrl || "").trim();
+    if (owlbear) url += "&obr=" + encodeURIComponent(owlbear);
+    return url;
   }
 
-  // Same hosted page, ambient's own room. The player opens this in a second
-  // window alongside the main link.
-  ambientViewerLink() {
-    const base = (this.settings.viewerBaseUrl || "").trim();
-    if (!base) return null;
-    return base + (base.includes("?") ? "&" : "?") + "room=" + this.settings.ambient.broadcastRoomId;
+  async copyPlayerLink(message) {
+    const url = this.viewerLink();
+    if (!url) {
+      new Notice("Set the viewer page URL in Dual View settings first.", 4000);
+      return;
+    }
+    try {
+      await navigator.clipboard.writeText(url);
+      new Notice(message || "Player link copied.", 2500);
+    } catch (e) {
+      new Notice("Couldn't reach the clipboard. Player link: " + url, 15000);
+    }
   }
 
-  // Which window/config the controller's control cluster currently drives.
-  targetWindow() {
-    return this.controlTarget === "ambient" ? this.ambient : this.dual;
-  }
-  targetConfig() {
-    return this.controlTarget === "ambient" ? this.settings.ambient : this.settings;
+  // Starts a fresh room and copies its link, ready to paste to players. A
+  // brand-new room ID can't still be held by the broker from an earlier
+  // session, which sidesteps the "already in use" stall. Asks first if
+  // anyone is connected, since the old link stops working.
+  async newPlayerLink() {
+    if (!(this.settings.viewerBaseUrl || "").trim()) {
+      new Notice("Set the viewer page URL in Dual View settings first.", 4000);
+      return;
+    }
+    const n = this.hub.conns.size;
+    if (n) {
+      const ok = await new Promise((resolve) => new ConfirmModal(
+        this.app,
+        n + (n === 1 ? " player is" : " players are") + " connected. A new link disconnects them until they open it.",
+        "New link",
+        resolve
+      ).open());
+      if (!ok) return;
+    }
+    this.settings.broadcastRoomId = makeRoomId();
+    this.settings.broadcast = true;
+    await this.saveSettings();
+    this.hub.restart();
+    await this.copyPlayerLink("New player link copied.");
+    this.refreshController();
   }
 
   // --- Ambient window (manual, image-only, fully independent) --------
@@ -1488,7 +1800,7 @@ module.exports = class DualViewPlugin extends Plugin {
   // Blanks the ambient screen to its background and clears its remote room,
   // leaving the window open for the next scene. No-op if it isn't open.
   clearAmbient() {
-    this.ambientBroadcaster.clearRemote();
+    this.ambient.remote.clearRemote();
     if (this.ambient.container) this.ambient.showBlank();
     this.ambientFile = null;
     this.refreshController();
@@ -1510,8 +1822,7 @@ module.exports = class DualViewPlugin extends Plugin {
   }
 
   onunload() {
-    if (this.broadcaster) this.broadcaster.destroy();
-    if (this.ambientBroadcaster) this.ambientBroadcaster.destroy();
+    if (this.hub) this.hub.destroy();
     if (this.dual) this.dual.close();
     if (this.ambient) this.ambient.close();
   }
@@ -1537,6 +1848,13 @@ module.exports = class DualViewPlugin extends Plugin {
   refreshController() {
     for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_CONTROLLER)) {
       if (leaf.view && typeof leaf.view.render === "function") leaf.view.render();
+    }
+  }
+
+  // Just the player status line, for room and connection changes.
+  refreshControllerStatus() {
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_CONTROLLER)) {
+      if (leaf.view && typeof leaf.view.updateLinkStatus === "function") leaf.view.updateLinkStatus();
     }
   }
 
@@ -1689,6 +2007,9 @@ module.exports = class DualViewPlugin extends Plugin {
     if (typeof this.settings.viewerBaseUrl !== "string") {
       this.settings.viewerBaseUrl = "";
     }
+    if (typeof this.settings.owlbearUrl !== "string") {
+      this.settings.owlbearUrl = "";
+    }
     // Generated once, then stable forever so the player's bookmark keeps
     // working. Regeneration is an explicit button in settings.
     if (!this.settings.broadcastRoomId) {
@@ -1698,8 +2019,10 @@ module.exports = class DualViewPlugin extends Plugin {
 
     // Ambient window's own bag. Filled from AMBIENT_DEFAULTS on first run,
     // then validated the same way as the main settings above so its colour
-    // pickers and room stay well-formed. Its room ID is stable once set.
+    // pickers stay well-formed.
     this.settings.ambient = Object.assign({}, AMBIENT_DEFAULTS, this.settings.ambient || {});
+    // Ambient used to have a room of its own; it now shares the main one.
+    delete this.settings.ambient.broadcastRoomId;
     if (!this.settings.ambient.hosts || typeof this.settings.ambient.hosts !== "object") {
       this.settings.ambient.hosts = {};
     }
@@ -1714,10 +2037,6 @@ module.exports = class DualViewPlugin extends Plugin {
     }
     if (typeof this.settings.ambient.broadcast !== "boolean") {
       this.settings.ambient.broadcast = AMBIENT_DEFAULTS.broadcast;
-    }
-    if (!this.settings.ambient.broadcastRoomId) {
-      this.settings.ambient.broadcastRoomId = makeRoomId();
-      await this.saveData(this.settings);
     }
   }
 
@@ -1837,26 +2156,38 @@ class DualViewSettings extends PluginSettingTab {
         })
       );
 
-    new Setting(containerEl).setName("Remote viewer").setHeading();
+    new Setting(containerEl).setName("Players").setHeading();
 
     new Setting(containerEl)
-      .setName("Broadcast to remote viewer")
-      .setDesc("Everything sent to the popout is also pushed to anyone with the viewer link. Nothing is stored on their machine or any server.")
+      .setName("Broadcast to players")
+      .setDesc("Everything sent to the popouts is also pushed to anyone with the player link. Nothing is stored on their machine or any server.")
       .addToggle((t) =>
         t.setValue(this.plugin.settings.broadcast).onChange(async (v) => {
           this.plugin.settings.broadcast = v;
           await this.plugin.saveSettings();
           if (v) {
-            this.plugin.broadcaster.start();
+            this.plugin.hub.start();
           } else {
-            this.plugin.broadcaster.stop();
+            this.plugin.hub.stop();
           }
+          this.plugin.refreshControllerStatus();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Mirror ambient screen")
+      .setDesc("Players can open the ambient screen from the viewer page. Turn off to keep ambient scenes on your table only.")
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.ambient.broadcast).onChange(async (v) => {
+          this.plugin.settings.ambient.broadcast = v;
+          await this.plugin.saveSettings();
+          if (!v) this.plugin.ambient.remote.clearRemote();
         })
       );
 
     new Setting(containerEl)
       .setName("Viewer page URL")
-      .setDesc("Where viewer.html is hosted, e.g. your GitHub Pages address. Used to build the link below.")
+      .setDesc("Where the viewer page is hosted, e.g. your GitHub Pages address. Used to build the player link.")
       .addText((t) =>
         t
           .setPlaceholder("https://username.github.io/dual-view-viewer/")
@@ -1864,70 +2195,34 @@ class DualViewSettings extends PluginSettingTab {
           .onChange(async (value) => {
             this.plugin.settings.viewerBaseUrl = value.trim();
             await this.plugin.saveSettings();
+            this.plugin.refreshControllerStatus();
           })
       );
 
     new Setting(containerEl)
-      .setName("Room ID")
-      .setDesc("Room: " + this.plugin.settings.broadcastRoomId + ". Regenerating invalidates the old link, so the player will need the new one.")
-      .addButton((b) =>
-        b.setButtonText("Copy viewer link").onClick(() => {
-          const url = this.plugin.viewerLink();
-          if (!url) {
-            new Notice("Set the viewer page URL first.", 3000);
-            return;
-          }
-          navigator.clipboard.writeText(url);
-          new Notice("Remote viewer link copied.", 2000);
-        })
-      )
-      .addButton((b) =>
-        b.setButtonText("Regenerate").onClick(async () => {
-          this.plugin.settings.broadcastRoomId = makeRoomId();
-          await this.plugin.saveSettings();
-          this.plugin.broadcaster.stop();
-          if (this.plugin.settings.broadcast) this.plugin.broadcaster.start();
-          this.display();
-        })
-      );
-
-    new Setting(containerEl).setName("Ambient remote").setHeading();
-
-    new Setting(containerEl)
-      .setName("Broadcast ambient to remote viewer")
-      .setDesc("Mirrors the ambient scene to its own room, separate from the main screen. The player opens both links in two windows.")
-      .addToggle((t) =>
-        t.setValue(this.plugin.settings.ambient.broadcast).onChange(async (v) => {
-          this.plugin.settings.ambient.broadcast = v;
-          await this.plugin.saveSettings();
-          if (v) {
-            this.plugin.ambientBroadcaster.start();
-          } else {
-            this.plugin.ambientBroadcaster.stop();
-          }
-        })
+      .setName("Owlbear Rodeo URL")
+      .setDesc("Your Owlbear Rodeo room. Players get an \"Open Owlbear Rodeo\" button on the viewer page, so it's one link for everything.")
+      .addText((t) =>
+        t
+          .setPlaceholder("https://www.owlbear.rodeo/room/...")
+          .setValue(this.plugin.settings.owlbearUrl)
+          .onChange(async (value) => {
+            this.plugin.settings.owlbearUrl = value.trim();
+            await this.plugin.saveSettings();
+            this.plugin.hub.helloAll();
+            this.plugin.refreshControllerStatus();
+          })
       );
 
     new Setting(containerEl)
-      .setName("Ambient room ID")
-      .setDesc("Room: " + this.plugin.settings.ambient.broadcastRoomId + ". Uses the same viewer page URL as the main screen, with its own room.")
+      .setName("Player link")
+      .setDesc("Room: " + this.plugin.settings.broadcastRoomId + ". \"New link\" starts a fresh room and copies it; anyone on the old link is disconnected.")
       .addButton((b) =>
-        b.setButtonText("Copy ambient link").onClick(() => {
-          const url = this.plugin.ambientViewerLink();
-          if (!url) {
-            new Notice("Set the viewer page URL first.", 3000);
-            return;
-          }
-          navigator.clipboard.writeText(url);
-          new Notice("Ambient remote link copied.", 2000);
-        })
+        b.setButtonText("Copy link").onClick(() => this.plugin.copyPlayerLink())
       )
       .addButton((b) =>
-        b.setButtonText("Regenerate").onClick(async () => {
-          this.plugin.settings.ambient.broadcastRoomId = makeRoomId();
-          await this.plugin.saveSettings();
-          this.plugin.ambientBroadcaster.stop();
-          if (this.plugin.settings.ambient.broadcast) this.plugin.ambientBroadcaster.start();
+        b.setButtonText("New link").setCta().onClick(async () => {
+          await this.plugin.newPlayerLink();
           this.display();
         })
       );

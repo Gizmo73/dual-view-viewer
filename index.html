@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
-<title>Dual View — Remote Table</title>
+<title>Dual View — Table</title>
 <style>
   :root {
     --ink: #e8e2d4;
@@ -64,7 +64,7 @@
     line-height: 1.3;
   }
 
-  /* Empty and waiting states. */
+  /* Landing, empty and waiting states. */
   #idle {
     position: fixed;
     inset: 0;
@@ -86,6 +86,30 @@
     width: 120px; height: 1px;
     background: linear-gradient(90deg, transparent, var(--ink-dim), transparent);
   }
+  #idle .actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 12px;
+    margin-top: 10px;
+  }
+  #idle .action {
+    display: inline-block;
+    padding: 10px 20px;
+    border: 1px solid var(--ink-dim);
+    border-radius: 999px;
+    background: none;
+    color: var(--ink);
+    font-family: inherit;
+    font-size: 15px;
+    text-decoration: none;
+    cursor: pointer;
+  }
+  #idle .action:hover, #idle .action:focus-visible {
+    border-color: var(--ink);
+    background: rgba(232, 226, 212, 0.06);
+  }
+  #idle .tip { font-size: 13px; }
   .hidden { display: none !important; }
 
   /* Connection badge, bottom-left, out of the way of most map corners. */
@@ -130,24 +154,37 @@
     transition: width 0.15s linear;
   }
 
-  /* Colour override panel, bottom-right, mirroring the badge. */
-  #paletteBtn {
+  /* Corner toolbar, bottom-right, mirroring the badge. Faded until used so
+     it stays out of the picture. */
+  #toolbar {
     position: fixed;
     right: 12px;
     bottom: 12px;
-    width: 34px; height: 34px;
-    border-radius: 50%;
+    display: flex;
+    gap: 8px;
+    z-index: 10;
+    opacity: 0.45;
+    transition: opacity 0.3s ease;
+  }
+  #toolbar:hover, #toolbar:focus-within { opacity: 1; }
+  #toolbar .tool {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 34px;
+    height: 34px;
+    padding: 0 12px;
     border: none;
+    border-radius: 999px;
     background: var(--badge-bg);
     color: var(--ink);
     font-family: inherit;
-    font-size: 14px;
+    font-size: 13px;
+    text-decoration: none;
     cursor: pointer;
-    z-index: 10;
-    opacity: 0.35;
-    transition: opacity 0.3s ease;
   }
-  #paletteBtn:hover, #paletteBtn:focus-visible { opacity: 1; }
+
+  /* Colour override panel, above the toolbar. */
   #palette {
     position: fixed;
     right: 12px;
@@ -186,7 +223,7 @@
   #palette button:hover { border-color: var(--ink); }
 
   @media (prefers-reduced-motion: reduce) {
-    #badge, #progress .bar, #paletteBtn { transition: none; }
+    #badge, #progress .bar, #toolbar { transition: none; }
   }
 </style>
 </head>
@@ -197,48 +234,63 @@
 </div>
 
 <div id="idle">
-  <h1>Remote Table</h1>
+  <h1 id="idleTitle">Remote Table</h1>
   <div class="rule"></div>
   <p id="idleMsg">Connecting…</p>
+  <div class="actions">
+    <a id="owlbearBig" class="action hidden" target="_blank" rel="noopener">Open Owlbear Rodeo</a>
+    <button id="ambientBig" class="action hidden" type="button">Open ambient screen</button>
+  </div>
+  <p id="idleTip" class="tip hidden">The ambient screen opens in its own window. Drag it onto another monitor, then press ⛶ in its corner for full screen.</p>
 </div>
 
 <div id="badge"><span class="dot"></span><span id="badgeText">Connecting</span></div>
 
-<button id="paletteBtn" title="Colours" aria-label="Colour settings">Aa</button>
+<div id="toolbar">
+  <a id="owlbearBtn" class="tool hidden" target="_blank" rel="noopener" title="Open Owlbear Rodeo">Map</a>
+  <button id="ambientBtn" class="tool hidden" type="button" title="Open the ambient screen in its own window">Ambient</button>
+  <button id="fullBtn" class="tool" type="button" title="Full screen" aria-label="Full screen">⛶</button>
+  <button id="paletteBtn" class="tool" type="button" title="Colours" aria-label="Colour settings">Aa</button>
+</div>
 <div id="palette" class="hidden">
   <label>Background <input type="color" id="pickBg"></label>
   <label>Text <input type="color" id="pickText"></label>
-  <button id="followDm">Follow DM</button>
+  <button id="followDm" type="button">Follow DM</button>
 </div>
 <div id="progress"><div class="bar" id="progressBar"></div></div>
 
-<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
 <script>
 (function () {
   "use strict";
 
-  var room = new URLSearchParams(location.search).get("room");
+  // One link does everything. ?room= is the DM's room; ?obr= is their
+  // Owlbear Rodeo room; ?view=ambient marks the window this page opens for
+  // the ambient screen.
+  var params = new URLSearchParams(location.search);
+  var room = params.get("room");
+  var isAmbient = params.get("view") === "ambient";
+  var view = isAmbient ? "ambient" : "main";
 
   var stage = document.getElementById("stage");
   var content = document.getElementById("content");
   var idle = document.getElementById("idle");
+  var idleTitle = document.getElementById("idleTitle");
   var idleMsg = document.getElementById("idleMsg");
+  var idleTip = document.getElementById("idleTip");
   var badge = document.getElementById("badge");
   var badgeText = document.getElementById("badgeText");
   var progressBar = document.getElementById("progressBar");
+  var owlbearBtn = document.getElementById("owlbearBtn");
+  var owlbearBig = document.getElementById("owlbearBig");
+  var ambientBtn = document.getElementById("ambientBtn");
+  var ambientBig = document.getElementById("ambientBig");
+  var fullBtn = document.getElementById("fullBtn");
 
-  if (!room) {
-    idleMsg.textContent = "No room in the link. Ask your DM to copy the viewer link again from Dual View's settings.";
-    badge.classList.add("bad");
-    badgeText.textContent = "No room ID";
-    return;
+  if (isAmbient) {
+    document.title = "Dual View — Ambient";
+    idleTitle.textContent = "Ambient";
   }
 
-  /* ---- Connection state ------------------------------------------------ */
-
-  var peer = null;
-  var conn = null;
-  var retryTimer = null;
   var badgeFadeTimer = null;
 
   function setBadge(state, text, fade) {
@@ -249,62 +301,258 @@
     if (fade) badgeFadeTimer = setTimeout(function () { badge.classList.add("faded"); }, 2500);
   }
 
-  function scheduleRetry(msg) {
-    if (retryTimer) return;
-    setBadge("bad", msg || "Reconnecting…");
-    if (!content.hasChildNodes()) {
-      idle.classList.remove("hidden");
-      idleMsg.textContent = "Waiting for your DM… this page will connect on its own once their table is up.";
+  if (!room) {
+    idleMsg.textContent = "No room in the link. Ask your DM for a new player link.";
+    setBadge("bad", "No room ID");
+    return;
+  }
+
+  /* ---- Owlbear Rodeo, the ambient window, full screen ------------------- */
+
+  // Only plain web links get through. The value comes from the URL, so
+  // anything else (javascript: and friends) is dropped.
+  function safeUrl(s) {
+    if (!s) return null;
+    try {
+      var u = new URL(s);
+      return (u.protocol === "https:" || u.protocol === "http:") ? u.href : null;
+    } catch (e) {
+      return null;
     }
+  }
+
+  var linkOwlbear = safeUrl(params.get("obr"));
+
+  function setOwlbear(url) {
+    var u = safeUrl(url);
+    [owlbearBtn, owlbearBig].forEach(function (a) {
+      if (u) a.href = u; else a.removeAttribute("href");
+      a.classList.toggle("hidden", !u);
+    });
+  }
+
+  // A named popup window, so pressing the button again brings the same
+  // window back rather than stacking up copies.
+  function openAmbient() {
+    var u = new URL(location.href);
+    u.search = "";
+    u.hash = "";
+    u.searchParams.set("room", room);
+    u.searchParams.set("view", "ambient");
+    var w = window.open(u.href, "dv-ambient-" + room, "popup,width=1280,height=720");
+    if (w) {
+      try { w.focus(); } catch (e) {}
+    } else {
+      idle.classList.remove("hidden");
+      idleMsg.textContent = "Your browser blocked the ambient window. Allow pop-ups for this page and try again.";
+    }
+  }
+
+  if (!isAmbient) {
+    setOwlbear(linkOwlbear);
+    ambientBtn.classList.remove("hidden");
+    ambientBig.classList.remove("hidden");
+    idleTip.classList.remove("hidden");
+    ambientBtn.addEventListener("click", openAmbient);
+    ambientBig.addEventListener("click", openAmbient);
+  }
+
+  if (!document.fullscreenEnabled) fullBtn.classList.add("hidden");
+  fullBtn.addEventListener("click", function () {
+    var p = document.fullscreenElement
+      ? document.exitFullscreen()
+      : document.documentElement.requestFullscreen();
+    if (p && p.catch) p.catch(function () {});
+  });
+
+  function showWaiting(text) {
+    if (content.hasChildNodes()) return;
+    idle.classList.remove("hidden");
+    idleMsg.textContent = text;
+  }
+
+  /* ---- Connection ------------------------------------------------------- */
+
+  // Both ends ping every HEARTBEAT_MS, and a link silent for DEAD_MS is dead.
+  // PeerJS never reports a channel that dies with a sleeping machine or
+  // dropped wifi; it just goes quiet.
+  var HEARTBEAT_MS = 10000;
+  var DEAD_MS = 35000;
+  // How long one attempt to reach the DM may take before it's abandoned.
+  var DIAL_TIMEOUT_MS = 15000;
+  // How long to wait on the broker before starting over with a fresh peer.
+  var REGISTER_TIMEOUT_MS = 20000;
+
+  var peer = null;
+  var peerStartedAt = 0;
+  var brokerFailures = 0;
+  var conn = null;           // the one live or pending connection
+  var dialTimer = null;
+  var retryTimer = null;
+  var lastSeen = 0;
+  var hostHeartbeat = false; // the DM's plugin pings; older versions don't
+
+  function isOpen() { return !!(conn && conn.open); }
+
+  // Closes the current connection, if any. Every handler below ignores
+  // events from any connection but the current one, so a stale attempt can
+  // never start a second, duplicate connection.
+  function dropConn() {
+    if (dialTimer) { clearTimeout(dialTimer); dialTimer = null; }
+    var c = conn;
+    conn = null;
+    if (c) { try { c.close(); } catch (e) {} }
+  }
+
+  function scheduleRetry(text, delay) {
+    setBadge("bad", text || "Reconnecting…");
+    if (retryTimer) return;
     retryTimer = setTimeout(function () {
       retryTimer = null;
       connect();
-    }, 4000);
+    }, delay == null ? 4000 : delay);
   }
 
-  function connect() {
-    if (conn && conn.open) return;
-    if (!peer || peer.destroyed) {
-      peer = new Peer();
-      peer.on("error", function (err) {
-        // "peer-unavailable" just means the DM isn't broadcasting yet.
-        if (err && err.type === "peer-unavailable") {
-          scheduleRetry("DM not broadcasting");
-        } else {
-          scheduleRetry("Connection trouble");
+  function retryNow() {
+    if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
+    connect();
+  }
+
+  function newPeer() {
+    if (peer) {
+      var old = peer;
+      peer = null;
+      try { old.destroy(); } catch (e) {}
+    }
+    var p = new Peer();
+    peer = p;
+    peerStartedAt = Date.now();
+    p.on("open", function () {
+      if (p !== peer) return;
+      brokerFailures = 0;
+      dial();
+    });
+    // The broker link dropped. An open connection to the DM keeps working;
+    // re-register quietly so the next dial has a broker to go through.
+    p.on("disconnected", function () {
+      if (p !== peer) return;
+      setTimeout(function () {
+        if (p === peer && p.disconnected && !p.destroyed) {
+          try { p.reconnect(); } catch (e) {}
         }
-      });
-      peer.on("disconnected", function () {
-        try { peer.reconnect(); } catch (e) { scheduleRetry(); }
-      });
-      peer.on("open", dial);
-      return;
+      }, 1000);
+    });
+    p.on("error", function (err) {
+      if (p !== peer) return;
+      var type = err && err.type;
+      if (type === "peer-unavailable") {
+        // The DM's room isn't up. PeerJS leaves the attempt open; close it.
+        dropConn();
+        showWaiting("Waiting for your DM… this page connects on its own once their table is up. If this link is from an earlier session, ask for the new one.");
+        scheduleRetry("Waiting for DM", 4000);
+        return;
+      }
+      // One connection's WebRTC setup failing says nothing about the broker.
+      if (type !== "webrtc" && type !== "negotiation-failed") brokerFailures += 1;
+      if (!isOpen()) {
+        dropConn();
+        showWaiting("Having trouble reaching the connection server. This page keeps retrying on its own.");
+        scheduleRetry("Connection trouble", Math.min(15000, 2000 * Math.max(1, brokerFailures)));
+      }
+    });
+  }
+
+  // Works out what's missing and fixes that one thing: a peer, a broker
+  // registration, or the connection itself. Safe to call any time.
+  function connect() {
+    if (isOpen() || dialTimer) return;
+    if (!peer || peer.destroyed || brokerFailures >= 3) {
+      newPeer();
+      return; // its "open" dials
+    }
+    if (peer.disconnected) {
+      try { peer.reconnect(); } catch (e) { newPeer(); }
+      return; // "open" fires again once re-registered, and dials
+    }
+    if (!peer.open) {
+      if (Date.now() - peerStartedAt > REGISTER_TIMEOUT_MS) newPeer();
+      return; // still registering; "open" dials
     }
     dial();
   }
 
   function dial() {
+    if (isOpen() || dialTimer || !peer || !peer.open) return;
+    dropConn();
     setBadge(null, "Connecting…");
-    try {
-      conn = peer.connect(room, { reliable: true });
-    } catch (e) {
-      scheduleRetry();
-      return;
-    }
-    conn.on("open", function () {
+    var c = null;
+    try { c = peer.connect(room, { reliable: true, metadata: { view: view } }); } catch (e) {}
+    if (!c) { scheduleRetry("Connection trouble"); return; }
+    conn = c;
+    hostHeartbeat = false;
+    dialTimer = setTimeout(function () {
+      dialTimer = null;
+      if (c !== conn || c.open) return;
+      dropConn();
+      showWaiting("Still trying to reach your DM…");
+      scheduleRetry("No answer", 1000);
+    }, DIAL_TIMEOUT_MS);
+
+    c.on("open", function () {
+      if (c !== conn) { try { c.close(); } catch (e) {} return; }
+      if (dialTimer) { clearTimeout(dialTimer); dialTimer = null; }
+      lastSeen = Date.now();
+      incoming = null;
+      setProgress(null);
       setBadge("ok", "Connected", true);
-      if (!content.hasChildNodes()) {
-        idleMsg.textContent = "Connected. Waiting for the DM to send something…";
-      }
+      showWaiting(isAmbient
+        ? "Connected. The ambient scene appears here when the DM sets one."
+        : "Connected. Waiting for the DM to send something…");
     });
-    conn.on("data", onData);
-    conn.on("close", function () { scheduleRetry("Disconnected"); });
-    conn.on("error", function () { scheduleRetry("Disconnected"); });
+    c.on("data", function (msg) {
+      if (c !== conn) return;
+      lastSeen = Date.now();
+      onData(msg);
+    });
+    c.on("close", function () {
+      if (c !== conn) return;
+      dropConn();
+      scheduleRetry("Disconnected", 1000);
+    });
+    c.on("error", function () {
+      if (c !== conn) return;
+      dropConn();
+      scheduleRetry("Disconnected", 1000);
+    });
   }
 
-  /* ---- Protocol: text | head + chunks + end ---------------------------- */
+  // Heartbeat plus watchdog: pings the DM, drops a link that has gone
+  // silent, and restarts the whole chain if nothing is in flight.
+  function tick() {
+    if (isOpen()) {
+      try { conn.send({ k: "ping" }); } catch (e) {}
+      // Only hold the DM to the heartbeat once their plugin has shown it
+      // pings, so an older plugin isn't dropped every 35 seconds.
+      if (hostHeartbeat && Date.now() - lastSeen > DEAD_MS) {
+        dropConn();
+        scheduleRetry("Connection lost", 0);
+      }
+    } else if (!retryTimer && !dialTimer) {
+      connect();
+    }
+  }
 
-  var incoming = null; // { id, chunks: [], received, total, size, mime, bg }
+  // Coming back to the tab or the network: don't wait out the retry timer.
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === "visible" && !isOpen()) retryNow();
+  });
+  window.addEventListener("online", function () {
+    if (!isOpen()) retryNow();
+  });
+
+  /* ---- Protocol: hello | ping | style | clear | text | head + chunks + end */
+
+  var incoming = null; // { id, parts: [], received, total, mime, bg }
   var currentUrl = null;
 
   function toUint8(b) {
@@ -321,13 +569,34 @@
   function onData(msg) {
     if (!msg || typeof msg !== "object") return;
 
+    if (msg.k === "ping") {
+      hostHeartbeat = true;
+      return;
+    }
+
+    if (msg.k === "hello") {
+      hostHeartbeat = true;
+      if (!isAmbient) setOwlbear(msg.owlbear || linkOwlbear);
+      return;
+    }
+
+    if (msg.k === "style") {
+      if (msg.backgroundColor) dmColors.bg = msg.backgroundColor;
+      if (msg.textColor) dmColors.text = msg.textColor;
+      if (msg.fontFamily) dmColors.font = msg.fontFamily;
+      if (content.hasChildNodes()) applyColors();
+      return;
+    }
+
     if (msg.k === "clear") {
       incoming = null;
       setProgress(null);
       clearContent();
       stage.style.background = "";
       idle.classList.remove("hidden");
-      idleMsg.textContent = "The table is between scenes. This page will update when the DM sends something.";
+      idleMsg.textContent = isAmbient
+        ? "No ambient scene right now. It'll appear here when the DM sets one."
+        : "The table is between scenes. This page will update when the DM sends something.";
       return;
     }
 
@@ -373,7 +642,7 @@
 
   /* ---- Colours: DM-sent values with optional player overrides ----------- */
 
-  var dmColors = { bg: "#000000", text: "#ffffff" };
+  var dmColors = { bg: "#000000", text: "#ffffff", font: "inherit" };
   var overrides = { bg: null, text: null };
   try {
     var saved = JSON.parse(localStorage.getItem("dv-viewer-colors") || "{}");
@@ -385,20 +654,25 @@
     try { localStorage.setItem("dv-viewer-colors", JSON.stringify(overrides)); } catch (e) {}
   }
 
-  // Restyles whatever's currently on screen. Called on every render and
-  // every picker change, so overrides apply live without a resend.
-  function applyColors() {
-    stage.style.background = overrides.bg || dmColors.bg;
-    var t = content.querySelector(".text");
-    if (t) t.style.color = overrides.text || dmColors.text;
-    pickBg.value = overrides.bg || dmColors.bg;
-    pickText.value = overrides.text || dmColors.text;
-  }
-
   var paletteBtn = document.getElementById("paletteBtn");
   var palette = document.getElementById("palette");
   var pickBg = document.getElementById("pickBg");
   var pickText = document.getElementById("pickText");
+
+  // Restyles whatever's currently on screen. Called on every render, every
+  // style update from the DM and every picker change, so changes apply live
+  // without a resend. "inherit" is the DM's Obsidian theme font, which this
+  // page can't know, so it falls back to the page's own.
+  function applyColors() {
+    stage.style.background = overrides.bg || dmColors.bg;
+    var t = content.querySelector(".text");
+    if (t) {
+      t.style.color = overrides.text || dmColors.text;
+      t.style.fontFamily = dmColors.font && dmColors.font !== "inherit" ? dmColors.font : "";
+    }
+    pickBg.value = overrides.bg || dmColors.bg;
+    pickText.value = overrides.text || dmColors.text;
+  }
 
   paletteBtn.addEventListener("click", function () {
     palette.classList.toggle("hidden");
@@ -445,12 +719,10 @@
     idle.classList.add("hidden");
     dmColors.bg = msg.backgroundColor || "#000000";
     dmColors.text = msg.textColor || "#ffffff";
+    dmColors.font = msg.fontFamily || "inherit";
     var div = document.createElement("div");
     div.className = "text";
     div.textContent = msg.text || "";
-    if (msg.fontFamily && msg.fontFamily !== "inherit") {
-      div.style.fontFamily = msg.fontFamily;
-    }
     content.appendChild(div);
     applyColors();
   }
@@ -539,7 +811,35 @@
 
   /* ---- Go ---------------------------------------------------------------- */
 
-  connect();
+  // PeerJS is served from this site first, so the page doesn't depend on a
+  // CDN being up; the CDNs are only fallbacks.
+  var PEERJS_SRCS = [
+    "vendor/peerjs.min.js",
+    "https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js",
+    "https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js",
+  ];
+
+  function loadPeerJs(done) {
+    if (window.Peer) { done(true); return; }
+    (function next(i) {
+      if (i >= PEERJS_SRCS.length) { done(false); return; }
+      var s = document.createElement("script");
+      s.src = PEERJS_SRCS[i];
+      s.onload = function () { if (window.Peer) done(true); else next(i + 1); };
+      s.onerror = function () { s.remove(); next(i + 1); };
+      document.head.appendChild(s);
+    })(0);
+  }
+
+  loadPeerJs(function (ok) {
+    if (!ok) {
+      idleMsg.textContent = "Couldn't load the connection library. Check your internet connection, then refresh.";
+      setBadge("bad", "Offline");
+      return;
+    }
+    connect();
+    setInterval(tick, HEARTBEAT_MS);
+  });
 })();
 </script>
 </body>
