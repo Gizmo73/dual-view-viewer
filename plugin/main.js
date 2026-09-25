@@ -6,7 +6,9 @@ const {
   ItemView,
   Setting,
   FileSystemAdapter,
+  FuzzySuggestModal,
   TFile,
+  TFolder,
   Menu,
   Modal,
   Notice,
@@ -45,7 +47,8 @@ const AMBIENT_DEFAULTS = {
   textColor: "#ffffff",
   fontFamily: "inherit",
   hosts: {},
-  broadcast: true         // mirror the ambient screen to players
+  broadcast: true,        // mirror the ambient screen to players
+  scenes: []              // premade scenes: [{ name, path, mode }], in display order
 };
 
 // Curated font choices. "inherit" pulls whatever font Obsidian's own theme
@@ -1222,6 +1225,27 @@ class ConfirmModal extends Modal {
   }
 }
 
+// Fuzzy search over every image in the vault, like the wikilink picker.
+class ImagePickerModal extends FuzzySuggestModal {
+  constructor(app, onChoose) {
+    super(app);
+    this.onChoose = onChoose;
+    this.setPlaceholder("Search for an image\u2026");
+  }
+
+  getItems() {
+    return this.app.vault.getFiles().filter(isImage);
+  }
+
+  getItemText(file) {
+    return file.path;
+  }
+
+  onChooseItem(file) {
+    this.onChoose(file);
+  }
+}
+
 // Docked tab in the main window, in three fixed sections: the player link,
 // the main screen (one sub-tab per sent image/text item plus its look), and
 // the ambient screen. Each screen's buttons only ever drive that screen, so
@@ -1298,40 +1322,47 @@ class DualViewController extends ItemView {
       const hub = plugin.hub;
       const state = {
         online: "Room online",
-        connecting: "Opening room…",
-        reconnecting: "Reconnecting…",
+        connecting: "Opening room\u2026",
+        reconnecting: "Reconnecting\u2026",
         off: "Room closed",
       }[hub.state] || hub.state;
-      text = state + " · " + hub.playerCount("main") + " on main, " +
+      text = state + " \u00B7 " + hub.playerCount("main") + " on main, " +
         hub.playerCount("ambient") + " on ambient";
-      if (!(s.owlbearUrl || "").trim()) text += " · no Owlbear link set";
+      if (!(s.owlbearUrl || "").trim()) text += " \u00B7 no Owlbear link set";
     }
     this.linkStatusEl.setText(text);
+  }
+
+  // One sub-tab per item sent to a screen, plus a "Showing" line. Clicking
+  // a tab puts it back up; the cross only removes it from the list.
+  renderTabs(sec, items, currentId, activate, close, emptyText) {
+    const tabs = sec.createDiv({ cls: "dual-view-controller__tabs" });
+    if (!items.length) {
+      tabs.createDiv({ cls: "dual-view-controller__empty", text: emptyText });
+    } else {
+      for (const item of items) {
+        const tab = tabs.createDiv({
+          cls: "dual-view-controller__tab" + (item.id === currentId ? " is-active" : ""),
+        });
+        const main = tab.createEl("button", { cls: "dual-view-controller__tab-main", text: item.title });
+        main.onclick = () => activate(item.id);
+        const x = tab.createEl("button", { cls: "dual-view-controller__tab-close", text: "\u00D7" });
+        x.onclick = (e) => { e.preventDefault(); e.stopPropagation(); close(item.id); };
+      }
+    }
+    const current = items.find((i) => i.id === currentId);
+    sec.createDiv({
+      cls: "dual-view-controller__status",
+      text: current ? "Showing: " + current.title : "No active item.",
+    });
   }
 
   renderMain(root) {
     const plugin = this.plugin;
     const sec = this.section(root, "Main screen", "main");
 
-    const tabs = sec.createDiv({ cls: "dual-view-controller__tabs" });
-    if (!plugin.screenItems.length) {
-      tabs.createDiv({ cls: "dual-view-controller__empty", text: "Nothing sent yet." });
-    } else {
-      for (const item of plugin.screenItems) {
-        const tab = tabs.createDiv({
-          cls: "dual-view-controller__tab" + (item.id === plugin.currentItemId ? " is-active" : ""),
-        });
-        const main = tab.createEl("button", { cls: "dual-view-controller__tab-main", text: item.title });
-        main.onclick = () => plugin.activateItem(item.id);
-        const close = tab.createEl("button", { cls: "dual-view-controller__tab-close", text: "×" });
-        close.onclick = (e) => { e.preventDefault(); e.stopPropagation(); plugin.closeItem(item.id); };
-      }
-    }
-    const current = plugin.screenItems.find((i) => i.id === plugin.currentItemId);
-    sec.createDiv({
-      cls: "dual-view-controller__status",
-      text: current ? "Showing: " + current.title : "No active item.",
-    });
+    this.renderTabs(sec, plugin.screenItems, plugin.currentItemId,
+      (id) => plugin.activateItem(id), (id) => plugin.closeItem(id), "Nothing sent yet.");
 
     this.renderWindowControls(sec, plugin.dual, plugin.settings, false);
 
@@ -1359,11 +1390,26 @@ class DualViewController extends ItemView {
     const plugin = this.plugin;
     const sec = this.section(root, "Ambient screen", "ambient");
 
+    this.renderTabs(sec, plugin.ambientItems, plugin.currentAmbientId,
+      (id) => plugin.activateAmbientItem(id), (id) => plugin.closeAmbientItem(id), "No scenes yet.");
+
+    // Premade scenes from settings. Picking one puts it up straight away.
     const sceneRow = sec.createDiv({ cls: "dual-view-controller__row" });
-    const sceneName = (plugin.ambient.container && plugin.ambientFile)
-      ? plugin.ambientFile.basename
-      : "none";
-    sceneRow.createSpan({ text: "Scene: " + sceneName });
+    sceneRow.createSpan({ text: "Scene:" });
+    const scenes = plugin.settings.ambient.scenes;
+    const sceneSelect = sceneRow.createEl("select");
+    sceneSelect.createEl("option", {
+      text: scenes.length ? "Choose a premade scene\u2026" : "No premade scenes (add in settings)",
+      value: "",
+    });
+    scenes.forEach((scene, i) => {
+      sceneSelect.createEl("option", { text: scene.name || scene.path || "Untitled", value: String(i) });
+    });
+    sceneSelect.disabled = !scenes.length;
+    sceneSelect.onchange = () => {
+      const scene = scenes[Number(sceneSelect.value)];
+      if (scene) plugin.sendAmbientScene(scene);
+    };
     const clearBtn = sceneRow.createEl("button", { text: "Clear scene" });
     clearBtn.onclick = () => plugin.clearAmbient();
 
@@ -1439,7 +1485,7 @@ class DualViewController extends ItemView {
         const opt = fontSelect.createEl("option", { text: label, value });
         if (fontKnown && value === cfg.fontFamily) opt.selected = true;
       }
-      const customFontOpt = fontSelect.createEl("option", { text: "Custom…", value: "custom" });
+      const customFontOpt = fontSelect.createEl("option", { text: "Custom\u2026", value: "custom" });
       if (!fontKnown) customFontOpt.selected = true;
       fontSelect.onchange = async () => {
         const value = fontSelect.value;
@@ -1468,7 +1514,7 @@ class DualViewController extends ItemView {
     presetRow.createSpan({ text: "Preset:" });
     const presetNames = Object.keys(plugin.settings.presets).sort();
     const presetSelect = presetRow.createEl("select");
-    presetSelect.createEl("option", { text: presetNames.length ? "Choose…" : "No presets saved", value: "" });
+    presetSelect.createEl("option", { text: presetNames.length ? "Choose\u2026" : "No presets saved", value: "" });
     for (const name of presetNames) {
       presetSelect.createEl("option", { text: name, value: name });
     }
@@ -1500,8 +1546,10 @@ module.exports = class DualViewPlugin extends Plugin {
     this.screenItems = [];
     this.currentItemId = null;
 
-    // The image currently on the ambient screen, for the controller label.
-    this.ambientFile = null;
+    // Same idea for the ambient screen: every scene set this session, each
+    // remembering its own mode, so earlier scenes are one click away.
+    this.ambientItems = [];
+    this.currentAmbientId = null;
 
     // For colour pickers and other rapid-fire inputs: one disk write once
     // the input settles, not one per tick of the drag.
@@ -1517,6 +1565,27 @@ module.exports = class DualViewPlugin extends Plugin {
     this.ambient = new DualWindow(this, this.settings.ambient, this.hub.channel("ambient", this.settings.ambient));
     // Ambient scene art defaults to a single upright image, not the split.
     this.ambient.mode = "single";
+
+    // Premade scenes store a vault path, so follow the image (or a folder
+    // above it) when it's renamed or moved rather than silently breaking.
+    this.registerEvent(
+      this.app.vault.on("rename", (file, oldPath) => {
+        let changed = false;
+        for (const scene of this.settings.ambient.scenes) {
+          if (file instanceof TFile && scene.path === oldPath) {
+            scene.path = file.path;
+            changed = true;
+          } else if (file instanceof TFolder && scene.path.startsWith(oldPath + "/")) {
+            scene.path = file.path + scene.path.slice(oldPath.length);
+            changed = true;
+          }
+        }
+        if (changed) {
+          this.saveSettings();
+          this.refreshController();
+        }
+      })
+    );
 
     this.registerEvent(
       this.app.workspace.on("window-close", (w) => {
@@ -1784,17 +1853,58 @@ module.exports = class DualViewPlugin extends Plugin {
 
   // --- Ambient window (manual, image-only, fully independent) --------
 
-  // Sends an image to the ambient screen. Deliberately separate from
-  // sendImage/sendText so nothing that feeds the main window (right-click,
-  // commands, or other plugins via sendImage) can ever land here.
-  async sendAmbientImage(file) {
+  // Sends an image to the ambient screen and records it in this session's
+  // scene list, reusing the entry if that image was already sent.
+  // Deliberately separate from sendImage/sendText so nothing that feeds the
+  // main window (right-click, commands, or other plugins via sendImage) can
+  // ever land here. The mode is, in order: the one asked for (a premade
+  // scene's), the one this image last used, the window's current one.
+  async sendAmbientImage(file, mode, title) {
     if (!(file instanceof TFile) || !isImage(file)) return;
-    this.ambientFile = file;
-    const mode = this.ambient.container ? this.ambient.mode : "single";
+    const signature = "image:" + file.path;
+    let item = this.ambientItems.find((i) => i.signature === signature);
+    const useMode = mode || (item && item.mode) ||
+      (this.ambient.container ? this.ambient.mode : "single");
+    if (item) {
+      item.mode = useMode;
+      if (title) item.title = title;
+    } else {
+      item = { id: makeItemId(), title: title || file.basename, signature, file, mode: useMode };
+      this.ambientItems.push(item);
+    }
+    this.currentAmbientId = item.id;
     await this.ensureControllerLeaf();
     this.refreshController();
-    await this.ambient.loadFile(file, mode);
-    new Notice("Ambient scene: " + file.basename, 2000);
+    await this.ambient.loadFile(file, useMode);
+    new Notice("Ambient scene: " + item.title, 2000);
+  }
+
+  // Puts up a premade scene from settings, in its own mode.
+  async sendAmbientScene(scene) {
+    const file = this.app.vault.getAbstractFileByPath(scene.path || "");
+    if (!(file instanceof TFile) || !isImage(file)) {
+      new Notice("Ambient scene \"" + (scene.name || "Untitled") + "\": image not found at " + (scene.path || "(no path)") + ".", 5000);
+      this.refreshController();
+      return;
+    }
+    await this.sendAmbientImage(file, scene.mode === "dual" ? "dual" : "single", scene.name || file.basename);
+  }
+
+  // Switches the ambient screen back to a scene from earlier this session.
+  async activateAmbientItem(id) {
+    const item = this.ambientItems.find((i) => i.id === id);
+    if (!item) return;
+    await this.sendAmbientImage(item.file, item.mode, item.title);
+  }
+
+  // Removes a scene from the list. The screen keeps showing it if it's up,
+  // same as the main screen's tabs.
+  closeAmbientItem(id) {
+    const idx = this.ambientItems.findIndex((i) => i.id === id);
+    if (idx < 0) return;
+    if (this.ambientItems[idx].id === this.currentAmbientId) this.currentAmbientId = null;
+    this.ambientItems.splice(idx, 1);
+    this.refreshController();
   }
 
   // Blanks the ambient screen to its background and clears its remote room,
@@ -1802,22 +1912,28 @@ module.exports = class DualViewPlugin extends Plugin {
   clearAmbient() {
     this.ambient.remote.clearRemote();
     if (this.ambient.container) this.ambient.showBlank();
-    this.ambientFile = null;
+    this.currentAmbientId = null;
     this.refreshController();
   }
 
   closeAmbient() {
     this.ambient.close();
-    this.ambientFile = null;
+    this.currentAmbientId = null;
     this.refreshController();
   }
 
-  // Flips the ambient window between single and dual, re-sending the current
-  // scene so the change takes effect. With no scene up, just sets the mode.
+  // Flips the ambient window between single and dual. With a scene up, that
+  // scene is re-sent in the new mode and remembers it; otherwise it just sets
+  // what the next scene will use.
   async toggleAmbientMode() {
     const newMode = this.ambient.mode === "single" ? "dual" : "single";
-    if (this.ambientFile) await this.ambient.loadFile(this.ambientFile, newMode);
-    else this.ambient.mode = newMode;
+    const current = this.ambientItems.find((i) => i.id === this.currentAmbientId);
+    if (current) {
+      current.mode = newMode;
+      await this.ambient.loadFile(current.file, newMode);
+    } else {
+      this.ambient.mode = newMode;
+    }
     this.refreshController();
   }
 
@@ -2038,6 +2154,15 @@ module.exports = class DualViewPlugin extends Plugin {
     if (typeof this.settings.ambient.broadcast !== "boolean") {
       this.settings.ambient.broadcast = AMBIENT_DEFAULTS.broadcast;
     }
+    // Premade scenes: keep well-formed entries only, each with a mode.
+    const scenes = Array.isArray(this.settings.ambient.scenes) ? this.settings.ambient.scenes : [];
+    this.settings.ambient.scenes = scenes
+      .filter((sc) => sc && typeof sc === "object")
+      .map((sc) => ({
+        name: typeof sc.name === "string" ? sc.name : "",
+        path: typeof sc.path === "string" ? sc.path : "",
+        mode: sc.mode === "dual" ? "dual" : "single",
+      }));
   }
 
   async saveSettings() {
@@ -2225,6 +2350,75 @@ class DualViewSettings extends PluginSettingTab {
           await this.plugin.newPlayerLink();
           this.display();
         })
+      );
+
+    new Setting(containerEl).setName("Ambient scenes").setHeading();
+    containerEl.createEl("p", {
+      cls: "setting-item-description",
+      text: "Premade scenes for the ambient screen, picked from the controller's Scene dropdown. Each has a name, an image from your vault and the mode it opens in.",
+    });
+
+    const scenes = this.plugin.settings.ambient.scenes;
+    const saveScenes = async (redraw) => {
+      await this.plugin.saveSettings();
+      this.plugin.refreshController();
+      if (redraw) this.display();
+    };
+    const pickImage = (onPick) => new ImagePickerModal(this.app, onPick).open();
+
+    scenes.forEach((scene, i) => {
+      const file = scene.path ? this.app.vault.getAbstractFileByPath(scene.path) : null;
+      const found = file instanceof TFile;
+      new Setting(containerEl)
+        .setDesc(!scene.path ? "No image chosen" : found ? scene.path : "Image not found: " + scene.path)
+        .addText((t) =>
+          t
+            .setPlaceholder("Scene name")
+            .setValue(scene.name)
+            .onChange((v) => {
+              scene.name = v.trim();
+              this.plugin.saveSettingsSoon();
+              this.plugin.refreshController();
+            })
+        )
+        .addButton((b) =>
+          b.setButtonText(found ? "Change image" : "Choose image").onClick(() =>
+            pickImage((f) => {
+              scene.path = f.path;
+              if (!scene.name) scene.name = f.basename;
+              saveScenes(true);
+            })
+          )
+        )
+        .addDropdown((d) =>
+          d
+            .addOption("single", "Single")
+            .addOption("dual", "Dual")
+            .setValue(scene.mode)
+            .onChange((v) => {
+              scene.mode = v === "dual" ? "dual" : "single";
+              saveScenes(false);
+            })
+        )
+        .addExtraButton((b) =>
+          b.setIcon("trash").setTooltip("Delete scene").onClick(() => {
+            scenes.splice(i, 1);
+            saveScenes(true);
+          })
+        );
+    });
+
+    // Adding starts with the picker, so a new scene always has an image; the
+    // name defaults to the file name and can be edited in its row.
+    new Setting(containerEl)
+      .setDesc(scenes.length ? "" : "No premade scenes yet.")
+      .addButton((b) =>
+        b.setButtonText("Add scene").setCta().onClick(() =>
+          pickImage((f) => {
+            scenes.push({ name: f.basename, path: f.path, mode: "single" });
+            saveScenes(true);
+          })
+        )
       );
 
     new Setting(containerEl).setName("Presets").setHeading();
