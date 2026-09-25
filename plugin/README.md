@@ -71,8 +71,8 @@ Rodeo room.
    controller (or run the "New player link" command). It opens a fresh room
    and copies the link; paste it to your players.
 3. Players open the link in a desktop browser. The page shows your main
-   screen, with buttons to open Owlbear Rodeo and the ambient screen (in its
-   own window, ready to drag onto a second monitor).
+   screen, with buttons to open Owlbear Rodeo and the ambient screen (in a
+   new tab, which they can drag out onto a second monitor).
 
 **Copy current link** re-sends the same link without disconnecting anyone.
 The controller's Players section shows whether the room is online and how
