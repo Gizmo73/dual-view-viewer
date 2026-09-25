@@ -1335,7 +1335,7 @@ class DualViewController extends ItemView {
 
   // One sub-tab per item sent to a screen, plus a "Showing" line. Clicking
   // a tab puts it back up; the cross only removes it from the list.
-  renderTabs(sec, items, currentId, activate, close, emptyText) {
+  renderTabs(sec, items, currentId, showing, activate, close, emptyText) {
     const tabs = sec.createDiv({ cls: "dual-view-controller__tabs" });
     if (!items.length) {
       tabs.createDiv({ cls: "dual-view-controller__empty", text: emptyText });
@@ -1350,10 +1350,9 @@ class DualViewController extends ItemView {
         x.onclick = (e) => { e.preventDefault(); e.stopPropagation(); close(item.id); };
       }
     }
-    const current = items.find((i) => i.id === currentId);
     sec.createDiv({
       cls: "dual-view-controller__status",
-      text: current ? "Showing: " + current.title : "No active item.",
+      text: showing ? "Showing: " + showing : "No active item.",
     });
   }
 
@@ -1361,7 +1360,8 @@ class DualViewController extends ItemView {
     const plugin = this.plugin;
     const sec = this.section(root, "Main screen", "main");
 
-    this.renderTabs(sec, plugin.screenItems, plugin.currentItemId,
+    const current = plugin.screenItems.find((i) => i.id === plugin.currentItemId);
+    this.renderTabs(sec, plugin.screenItems, plugin.currentItemId, current && current.title,
       (id) => plugin.activateItem(id), (id) => plugin.closeItem(id), "Nothing sent yet.");
 
     this.renderWindowControls(sec, plugin.dual, plugin.settings, false);
@@ -1390,8 +1390,11 @@ class DualViewController extends ItemView {
     const plugin = this.plugin;
     const sec = this.section(root, "Ambient screen", "ambient");
 
-    this.renderTabs(sec, plugin.ambientItems, plugin.currentAmbientId,
-      (id) => plugin.activateAmbientItem(id), (id) => plugin.closeAmbientItem(id), "No scenes yet.");
+    // History holds ad hoc scenes only; premade ones live in the dropdown
+    // below and don't pile up here.
+    const shown = plugin.ambientShowing();
+    this.renderTabs(sec, plugin.ambientItems, plugin.currentAmbientId, shown && shown.title,
+      (id) => plugin.activateAmbientItem(id), (id) => plugin.closeAmbientItem(id), "No ad hoc scenes yet.");
 
     // Premade scenes from settings. Picking one puts it up straight away.
     const sceneRow = sec.createDiv({ cls: "dual-view-controller__row" });
@@ -1546,10 +1549,13 @@ module.exports = class DualViewPlugin extends Plugin {
     this.screenItems = [];
     this.currentItemId = null;
 
-    // Same idea for the ambient screen: every scene set this session, each
-    // remembering its own mode, so earlier scenes are one click away.
+    // Same idea for the ambient screen, for ad hoc scenes (right-click or
+    // command): each remembers its own mode, so earlier ones are one click
+    // away. Premade scenes aren't listed here; the controller's dropdown
+    // is how they're reached, and ambientPremade tracks one while it's up.
     this.ambientItems = [];
     this.currentAmbientId = null;
+    this.ambientPremade = null;   // { title, file, mode } while a premade scene is up
 
     // For colour pickers and other rapid-fire inputs: one disk write once
     // the input settles, not one per tick of the drag.
@@ -1853,12 +1859,12 @@ module.exports = class DualViewPlugin extends Plugin {
 
   // --- Ambient window (manual, image-only, fully independent) --------
 
-  // Sends an image to the ambient screen and records it in this session's
-  // scene list, reusing the entry if that image was already sent.
+  // Sends an ad hoc image to the ambient screen and records it in this
+  // session's scene list, reusing the entry if that image was already sent.
   // Deliberately separate from sendImage/sendText so nothing that feeds the
   // main window (right-click, commands, or other plugins via sendImage) can
-  // ever land here. The mode is, in order: the one asked for (a premade
-  // scene's), the one this image last used, the window's current one.
+  // ever land here. The mode is, in order: the one asked for, the one this
+  // image last used, the window's current one.
   async sendAmbientImage(file, mode, title) {
     if (!(file instanceof TFile) || !isImage(file)) return;
     const signature = "image:" + file.path;
@@ -1873,13 +1879,15 @@ module.exports = class DualViewPlugin extends Plugin {
       this.ambientItems.push(item);
     }
     this.currentAmbientId = item.id;
+    this.ambientPremade = null;
     await this.ensureControllerLeaf();
     this.refreshController();
     await this.ambient.loadFile(file, useMode);
     new Notice("Ambient scene: " + item.title, 2000);
   }
 
-  // Puts up a premade scene from settings, in its own mode.
+  // Puts up a premade scene from settings, in its saved mode. It doesn't go
+  // into the scene list; the dropdown is how it's reached again.
   async sendAmbientScene(scene) {
     const file = this.app.vault.getAbstractFileByPath(scene.path || "");
     if (!(file instanceof TFile) || !isImage(file)) {
@@ -1887,7 +1895,19 @@ module.exports = class DualViewPlugin extends Plugin {
       this.refreshController();
       return;
     }
-    await this.sendAmbientImage(file, scene.mode === "dual" ? "dual" : "single", scene.name || file.basename);
+    const mode = scene.mode === "dual" ? "dual" : "single";
+    this.ambientPremade = { title: scene.name || file.basename, file, mode };
+    this.currentAmbientId = null;
+    await this.ensureControllerLeaf();
+    this.refreshController();
+    await this.ambient.loadFile(file, mode);
+    new Notice("Ambient scene: " + this.ambientPremade.title, 2000);
+  }
+
+  // Whatever is on the ambient screen now: an ad hoc scene from the list,
+  // a premade scene, or nothing.
+  ambientShowing() {
+    return this.ambientItems.find((i) => i.id === this.currentAmbientId) || this.ambientPremade;
   }
 
   // Switches the ambient screen back to a scene from earlier this session.
@@ -1913,21 +1933,24 @@ module.exports = class DualViewPlugin extends Plugin {
     this.ambient.remote.clearRemote();
     if (this.ambient.container) this.ambient.showBlank();
     this.currentAmbientId = null;
+    this.ambientPremade = null;
     this.refreshController();
   }
 
   closeAmbient() {
     this.ambient.close();
     this.currentAmbientId = null;
+    this.ambientPremade = null;
     this.refreshController();
   }
 
   // Flips the ambient window between single and dual. With a scene up, that
-  // scene is re-sent in the new mode and remembers it; otherwise it just sets
-  // what the next scene will use.
+  // scene is re-sent in the new mode. An ad hoc scene remembers the change;
+  // a premade scene's saved mode is left alone (change that in settings).
+  // With nothing up, it just sets what the next scene will use.
   async toggleAmbientMode() {
     const newMode = this.ambient.mode === "single" ? "dual" : "single";
-    const current = this.ambientItems.find((i) => i.id === this.currentAmbientId);
+    const current = this.ambientShowing();
     if (current) {
       current.mode = newMode;
       await this.ambient.loadFile(current.file, newMode);
