@@ -71,8 +71,8 @@ Rodeo room.
    controller (or run the "New player link" command). It opens a fresh room
    and copies the link; paste it to your players.
 3. Players open the link in a desktop browser. The page shows your main
-   screen, with buttons to open Owlbear Rodeo and the ambient screen (in its
-   own window, ready to drag onto a second monitor).
+   screen, with buttons to open Owlbear Rodeo and the ambient screen (in a
+   new tab, which they can drag out onto a second monitor).
 
 **Copy current link** re-sends the same link without disconnecting anyone.
 The controller's Players section shows whether the room is online and how
@@ -82,3 +82,16 @@ many players are on each screen.
 
 The controller tab has three fixed sections: **Players**, **Main screen** and
 **Ambient screen**. Each screen's buttons only ever drive that screen.
+
+Both screens keep a list of what's been sent this session (for the ambient
+screen, ad hoc scenes only; premade scenes stay in their dropdown). Click an
+entry to put it back up in the mode it last used; the cross just removes it
+from the list.
+
+## Ambient scenes
+
+In settings, **Ambient scenes** holds premade scenes: a name, an image from
+your vault (picked with a search box, like linking a file) and the mode it
+opens in. **Add scene** starts with the image search. The controller's
+**Scene** dropdown puts one up straight away; they don't get added to the
+ad hoc scene list. Scenes follow their image if you rename or move it.

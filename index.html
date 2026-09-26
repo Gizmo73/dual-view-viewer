@@ -241,14 +241,14 @@
     <a id="owlbearBig" class="action hidden" target="_blank" rel="noopener">Open Owlbear Rodeo</a>
     <button id="ambientBig" class="action hidden" type="button">Open ambient screen</button>
   </div>
-  <p id="idleTip" class="tip hidden">The ambient screen opens in its own window. Drag it onto another monitor, then press ⛶ in its corner for full screen.</p>
+  <p id="idleTip" class="tip hidden">The ambient screen opens in a new tab. Drag the tab out to put it on another monitor, then press ⛶ in its corner for full screen.</p>
 </div>
 
 <div id="badge"><span class="dot"></span><span id="badgeText">Connecting</span></div>
 
 <div id="toolbar">
   <a id="owlbearBtn" class="tool hidden" target="_blank" rel="noopener" title="Open Owlbear Rodeo">Map</a>
-  <button id="ambientBtn" class="tool hidden" type="button" title="Open the ambient screen in its own window">Ambient</button>
+  <button id="ambientBtn" class="tool hidden" type="button" title="Open the ambient screen in a new tab">Ambient</button>
   <button id="fullBtn" class="tool" type="button" title="Full screen" aria-label="Full screen">⛶</button>
   <button id="paletteBtn" class="tool" type="button" title="Colours" aria-label="Colour settings">Aa</button>
 </div>
@@ -331,21 +331,26 @@
     });
   }
 
-  // A named popup window, so pressing the button again brings the same
-  // window back rather than stacking up copies.
+  // Opens the ambient screen in a named tab. Opening by name with no URL
+  // returns the existing tab untouched if there is one, so pressing the
+  // button again just switches to it rather than reloading it or stacking
+  // up copies. A brand-new tab comes back blank and is pointed at the page.
   function openAmbient() {
     var u = new URL(location.href);
     u.search = "";
     u.hash = "";
     u.searchParams.set("room", room);
     u.searchParams.set("view", "ambient");
-    var w = window.open(u.href, "dv-ambient-" + room, "popup,width=1280,height=720");
-    if (w) {
-      try { w.focus(); } catch (e) {}
-    } else {
+    var w = window.open("", "dv-ambient-" + room);
+    if (!w) {
       idle.classList.remove("hidden");
-      idleMsg.textContent = "Your browser blocked the ambient window. Allow pop-ups for this page and try again.";
+      idleMsg.textContent = "Your browser blocked the ambient tab. Allow pop-ups for this page and try again.";
+      return;
     }
+    var fresh = true;
+    try { fresh = w.location.href === "about:blank"; } catch (e) {}
+    if (fresh) w.location.href = u.href;
+    try { w.focus(); } catch (e) {}
   }
 
   if (!isAmbient) {
@@ -571,6 +576,10 @@
 
     if (msg.k === "ping") {
       hostHeartbeat = true;
+      // Answer straight away. Browsers slow timers in background tabs, so
+      // the page's own pings can lag; replying from the message event keeps
+      // the DM's side from mistaking a background tab for a dead one.
+      try { conn.send({ k: "pong" }); } catch (e) {}
       return;
     }
 
