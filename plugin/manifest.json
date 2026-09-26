@@ -1,7 +1,7 @@
 {
   "id": "dual-view",
   "name": "Dual View",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "minAppVersion": "1.0.0",
   "description": "Right-click an image to open it in a popout window on your second screen: split for two viewers or full-screen for one, rotated to match a portrait or landscape physical setup, with zoom and pan. Fully independent of Second Window.",
   "author": "Gizmo734",

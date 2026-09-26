@@ -1,0 +1,51 @@
+name: Release plugin
+
+# Publishes a GitHub release of the Obsidian plugin whenever the version in
+# plugin/manifest.json changes on main. BRAT installs and updates from these
+# releases, so bumping the version in a PR and merging it is all a release
+# takes. A version with a suffix (e.g. 2.3.0-beta.1) is published as a
+# pre-release. Run it by hand from the Actions tab to retry a failed release.
+on:
+  push:
+    branches: [main]
+    paths: [plugin/manifest.json]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read and check version
+        id: version
+        run: |
+          version=$(jq -r .version plugin/manifest.json)
+          if ! echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::plugin/manifest.json version '$version' isn't x.y.z (or x.y.z-suffix)."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check main.js parses
+        run: node --check plugin/main.js
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "Release $VERSION already exists; nothing to do."
+            exit 0
+          fi
+          prerelease=""
+          case "$VERSION" in *-*) prerelease="--prerelease" ;; esac
+          gh release create "$VERSION" plugin/main.js plugin/manifest.json \
+            --title "$VERSION" \
+            --target "$GITHUB_SHA" \
+            --generate-notes \
+            $prerelease

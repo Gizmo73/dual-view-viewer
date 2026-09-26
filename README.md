@@ -9,5 +9,6 @@ ambient screen.
   Owlbear Rodeo room, `?view=ambient` the ambient window it opens itself.
 - `vendor/peerjs.min.js`: PeerJS 1.5.4 (MIT, see `vendor/PEERJS-LICENSE`),
   served from here so the page doesn't depend on a CDN.
-- `plugin/`: the Obsidian plugin. Copy `main.js` and `manifest.json` into
-  `<vault>/.obsidian/plugins/dual-view/`.
+- `plugin/`: the Obsidian plugin. Install and update it with BRAT using
+  `Gizmo73/dual-view-viewer`; see `plugin/README.md`. Releases are published
+  automatically when `plugin/manifest.json`'s version changes on main.

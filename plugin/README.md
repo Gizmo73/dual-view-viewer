@@ -33,9 +33,28 @@ when the physical setup is mirrored from the default.
 
 ## Install
 
-1. Copy this `dual-view` folder into:
-   `<your vault>\.obsidian\plugins\dual-view\`
-2. Settings, Community plugins, reload, then enable Dual View.
+With [BRAT](https://github.com/TfTHacker/obsidian42-brat) (recommended, it
+keeps the plugin updated):
+
+1. Install and enable BRAT from Community plugins.
+2. Run "BRAT: Add a beta plugin for testing" and enter `Gizmo73/dual-view-viewer`.
+3. Enable Dual View under Community plugins.
+
+BRAT then checks for new releases on startup, or on demand with "BRAT: Check
+for updates to all beta plugins". Your settings are kept across updates.
+
+By hand: copy `main.js` and `manifest.json` from the latest
+[release](https://github.com/Gizmo73/dual-view-viewer/releases) into
+`<your vault>/.obsidian/plugins/dual-view/`, then reload Community plugins.
+
+## Releasing
+
+Bump `version` in `plugin/manifest.json` (e.g. `2.2.0` to `2.3.0`) in the
+same PR as the change, then merge it. The "Release plugin" GitHub Action
+publishes a release with `main.js` and `manifest.json` attached, tagged with
+that version, and BRAT picks it up. A version with a suffix, like
+`2.3.0-beta.1`, goes out as a pre-release. Merges that don't change the
+version publish nothing.
 
 ## Use
 
