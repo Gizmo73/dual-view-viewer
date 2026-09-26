@@ -99,7 +99,11 @@ many players are on each screen.
 
 ## Controller
 
-The controller tab has three fixed sections: **Players**, **Main screen** and
+Open it with the dashboard icon in the left ribbon, or the "Open controller"
+command; it opens in the right sidebar. It also opens by itself the first time
+you send something.
+
+The controller has three fixed sections: **Players**, **Main screen** and
 **Ambient screen**. Each screen's buttons only ever drive that screen.
 
 Both screens keep a list of what's been sent this session (for the ambient
