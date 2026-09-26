@@ -1563,6 +1563,15 @@ module.exports = class DualViewPlugin extends Plugin {
 
     this.registerView(VIEW_TYPE_CONTROLLER, (leaf) => new DualViewController(leaf, this));
 
+    // Left ribbon icon and a command (for a hotkey) to bring up the
+    // controller, same icon as the controller's own tab.
+    this.addRibbonIcon("layout-dashboard", "Open Dual View controller", () => this.ensureControllerLeaf());
+    this.addCommand({
+      id: "open-controller",
+      name: "Open controller",
+      callback: () => this.ensureControllerLeaf(),
+    });
+
     // One player room for both windows. Each window gets its own channel,
     // reading its own settings bag, so the main and ambient screens stay
     // independent while players need only one link.
@@ -1968,15 +1977,17 @@ module.exports = class DualViewPlugin extends Plugin {
 
   // --- Controller tab management ------------------------------------
 
-  // Finds any open controller leaf, or opens one as a new tab in the main
-  // window. There's only ever meant to be one.
+  // Finds any open controller leaf, or opens one in the right sidebar, so
+  // bringing it up never pulls the note you're reading out of view. There's
+  // only ever meant to be one; if you've dragged it somewhere else, it's
+  // revealed wherever it is.
   async ensureControllerLeaf() {
     const existing = this.app.workspace.getLeavesOfType(VIEW_TYPE_CONTROLLER);
     if (existing.length) {
       await this.app.workspace.revealLeaf(existing[0]);
       return existing[0];
     }
-    const leaf = this.app.workspace.getLeaf("tab");
+    const leaf = this.app.workspace.getRightLeaf(false);
     await leaf.setViewState({ type: VIEW_TYPE_CONTROLLER, active: true });
     await this.app.workspace.revealLeaf(leaf);
     return leaf;
