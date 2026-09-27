@@ -111,6 +111,12 @@ screen, ad hoc scenes only; premade scenes stay in their dropdown). Click an
 entry to put it back up in the mode it last used; the cross just removes it
 from the list.
 
+Some entries carry several versions of one image, such as a zoom map sent
+through the bridge with and without its overlays. Those show a **Showing:**
+row under the list with a button per version. Switching keeps the current
+zoom and pan, and every fresh send starts on the first version (the base map).
+Other plugins send these with `sendImageVariants([{ label, file }, ...], mode)`.
+
 ## Ambient scenes
 
 In settings, **Ambient scenes** holds premade scenes: a name, an image from

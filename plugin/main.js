@@ -679,14 +679,16 @@ class DualWindow {
     try { this.container.rootEl.querySelector(".status-bar").detach(); } catch (e) {}
   }
 
-  async loadFile(file, mode) {
+  // keepView leaves zoom/pan alone, for swapping between variants of the
+  // same image (e.g. a map with and without overlays) mid-scene.
+  async loadFile(file, mode, keepView) {
     const app = this.plugin.app;
     if (!(app.vault.adapter instanceof FileSystemAdapter)) return;
 
     this.mode = mode === "single" ? "single" : "dual";
     this.currentText = null;
     this.contentKind = "image";
-    this.resetViewState();
+    if (!keepView) this.resetViewState();
 
     await this.ensurePopout();
     await this.leaf.openFile(file, { state: { mode: "preview" } });
@@ -1364,6 +1366,18 @@ class DualViewController extends ItemView {
     this.renderTabs(sec, plugin.screenItems, plugin.currentItemId, current && current.title,
       (id) => plugin.activateItem(id), (id) => plugin.closeItem(id), "Nothing sent yet.");
 
+    // Variant switcher, for items sent with several versions of one image.
+    const variants = current && current.kind === "image" && current.data.variants;
+    if (variants && variants.length > 1) {
+      const varRow = sec.createDiv({ cls: "dual-view-controller__row" });
+      varRow.createSpan({ text: "Showing:" });
+      variants.forEach((v, idx) => {
+        const btn = varRow.createEl("button", { text: v.label });
+        if (idx === current.data.variantIndex) btn.addClass("mod-cta");
+        btn.onclick = () => plugin.setItemVariant(current.id, idx);
+      });
+    }
+
     this.renderWindowControls(sec, plugin.dual, plugin.settings, false);
 
     const saveRow = sec.createDiv({ cls: "dual-view-controller__row" });
@@ -2025,6 +2039,51 @@ module.exports = class DualViewPlugin extends Plugin {
     await this.ensureControllerLeaf();
     this.refreshController();
     await this.dual.loadFile(file, mode);
+  }
+
+  // Sends several versions of one image as a single tab, with a switcher in
+  // the controller (e.g. the zoom map bridge's base map and base + overlays).
+  // variants: [{ label, file }, ...]. The tab is keyed on the first variant's
+  // path, so re-sends reuse it; every send starts on the first variant.
+  async sendImageVariants(variants, mode) {
+    const list = (variants || []).filter((v) => v && v.file);
+    if (!list.length) return;
+    if (list.length === 1) return this.sendImage(list[0].file, mode);
+    const file = list[0].file;
+    const signature = "image:" + file.path;
+    const data = {
+      file,
+      mode,
+      variants: list.map((v, i) => ({ label: v.label || "Variant " + (i + 1), file: v.file })),
+      variantIndex: 0,
+    };
+    let item = this.screenItems.find((i) => i.signature === signature);
+    if (item) {
+      item.title = file.basename;
+      item.kind = "image";
+      item.data = data;
+    } else {
+      item = { id: makeItemId(), kind: "image", title: file.basename, signature, data };
+      this.screenItems.push(item);
+    }
+    this.currentItemId = item.id;
+    await this.ensureControllerLeaf();
+    this.refreshController();
+    await this.dual.loadFile(file, mode);
+  }
+
+  // Switches a multi-variant tab to another variant. If it's the one
+  // showing, the popout swaps images in place, keeping zoom and pan.
+  async setItemVariant(id, index) {
+    const item = this.screenItems.find((i) => i.id === id);
+    const variants = item && item.data && item.data.variants;
+    if (!variants || !variants[index]) return;
+    item.data.variantIndex = index;
+    item.data.file = variants[index].file;
+    this.refreshController();
+    if (id === this.currentItemId) {
+      await this.dual.loadFile(item.data.file, item.data.mode, true);
+    }
   }
 
   // Sends a text snippet. Always creates a new tab, since two sends are
