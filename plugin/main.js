@@ -21,6 +21,7 @@ const VIEW_TYPE_CONTROLLER = "dual-view-controller";
 const DEFAULTS = {
   swap: false,
   orientation: "portrait", // "portrait" or "landscape" (the physical screen)
+  divider: true,          // rail between the two halves in dual view
   rememberPosition: true,
   backgroundColor: "#000000",
   textColor: "#ffffff",
@@ -42,6 +43,7 @@ const DEFAULTS = {
 const AMBIENT_DEFAULTS = {
   swap: false,
   orientation: "landscape",
+  divider: true,
   rememberPosition: true,
   backgroundColor: "#000000",
   textColor: "#ffffff",
@@ -557,6 +559,21 @@ class RemoteChannel {
     }
   }
 
+  // The laser pointer's position as fractions of the image (0..1 across and
+  // down), or null once it's let go. `t` is when the cursor was there, in
+  // this computer's milliseconds, so players can replay the stroke at its
+  // real pace however unevenly the messages arrive. Images only: text wraps
+  // differently on each player's screen, so a spot on it wouldn't line up.
+  sendLaser(pt) {
+    if (!this.config.broadcast || !this.last || this.last.kind !== "image") return;
+    const msg = pt
+      ? { k: "laser", x: Math.round(pt.x * 10000) / 10000, y: Math.round(pt.y * 10000) / 10000, t: Math.round(pt.t) }
+      : { k: "laser-off" };
+    for (const conn of this.targets()) {
+      try { conn.send(msg); } catch (e) {}
+    }
+  }
+
   // Blanks this screen's players and forgets the last payload, so neither
   // current nor late-joining players keep seeing content the table has
   // closed. Bumping transferId also aborts any in-flight image send.
@@ -566,6 +583,73 @@ class RemoteChannel {
     for (const conn of this.targets()) {
       try { conn.send({ k: "clear" }); } catch (e) {}
     }
+  }
+}
+
+// The rail between the two halves in dual view: a light line with dark
+// edges, so the split stands out on light and dark maps alike. It takes its
+// own space rather than covering the picture.
+const DIVIDER_PX = 7;
+const DIVIDER_EDGE_PX = 2;
+const DIVIDER_LIGHT = "#f4efe2";
+const DIVIDER_DARK = "#000000";
+
+// Laser pointer: hold the right mouse button on a table screen.
+const LASER_TRAIL_MS = 400;  // how long the trail lingers behind the dot
+const LASER_FADE_MS = 1000;  // how long the dot takes to fade once let go
+const LASER_SEND_MS = 33;    // player updates, about 30 a second
+const LASER_DOT_R = 8;
+
+// Draws the laser's trail and dot onto one canvas. `place` turns a point in
+// image fractions into a point on this canvas, or null.
+function drawLaser(canvas, dpr, pts, dot, dotAlpha, now, place) {
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  const bw = Math.round(w * dpr), bh = Math.round(h * dpr);
+  if (canvas.width !== bw || canvas.height !== bh) { canvas.width = bw; canvas.height = bh; }
+  const g = canvas.getContext("2d");
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, w, h);
+  g.lineCap = "round";
+  g.lineJoin = "round";
+  g.shadowColor = "rgba(255, 42, 42, 0.8)";
+  g.shadowBlur = 10;
+  // The trail tapers: older stretches are thinner and fainter. It's drawn in
+  // a few age bands, each as one continuous path, because stroking every
+  // little segment on its own overlaps their round ends into visible beads.
+  const BANDS = 8;
+  const bandOf = (p) => Math.max(0, Math.min(BANDS - 1, Math.floor((1 - (now - p.t) / LASER_TRAIL_MS) * BANDS)));
+  const spots = pts.map(place);
+  let start = 0;
+  while (start < pts.length - 1) {
+    const b = bandOf(pts[start + 1]);
+    let end = start + 1;
+    while (end + 1 < pts.length && bandOf(pts[end + 1]) === b) end++;
+    const k = (b + 1) / BANDS;
+    g.strokeStyle = "rgba(255, 42, 42, " + (0.9 * k).toFixed(3) + ")";
+    g.lineWidth = 2 + 5 * k;
+    g.beginPath();
+    let open = false;
+    for (let j = start; j <= end; j++) {
+      const q = spots[j];
+      if (!q) { open = false; continue; }
+      if (open) g.lineTo(q.x, q.y); else { g.moveTo(q.x, q.y); open = true; }
+    }
+    g.stroke();
+    start = end;
+  }
+  const q = dot && dotAlpha > 0 ? place(dot) : null;
+  if (q) {
+    g.globalAlpha = dotAlpha;
+    g.fillStyle = "#ff2a2a";
+    g.beginPath();
+    g.arc(q.x, q.y, LASER_DOT_R, 0, Math.PI * 2);
+    g.fill();
+    g.shadowBlur = 0;
+    g.fillStyle = "#ffffff";
+    g.beginPath();
+    g.arc(q.x, q.y, LASER_DOT_R * 0.35, 0, Math.PI * 2);
+    g.fill();
+    g.globalAlpha = 1;
   }
 }
 
@@ -591,12 +675,27 @@ class DualWindow {
     this.panY = 0;
     this._drag = null;
 
+    // Laser pointer. Points are image fractions, so every surface (both
+    // halves) and every player draws the same spot of the picture.
+    this._laser = null;         // { id } while the right button is held
+    this.laserPts = [];         // recent points for the trail: { x, y, t }
+    this.laserDot = null;       // where the dot is, until it fades
+    this.laserOffAt = 0;
+    this._laserRaf = 0;
+    this._laserTimer = null;    // throttles sends to players
+    this._laserPending = null;
+
     this.boundSize = () => { this.size(); this.applyTransforms(); this.fitText(); };
     this.onWheel = (e) => this.handleWheel(e);
     this.onPointerDown = (e) => this.handlePointerDown(e);
     this.onPointerMove = (e) => this.handlePointerMove(e);
     this.onPointerUp = (e) => this.handlePointerUp(e);
     this.onDblClick = (e) => { if (e) e.stopPropagation(); this.resetView(); };
+    // Right-click is the laser, so the table screens get no context menu.
+    this.onContextMenu = (e) => { e.preventDefault(); e.stopPropagation(); };
+    this.onLostCapture = (e) => {
+      if (this._laser && e.pointerId === this._laser.id) this.laserEnd(e);
+    };
   }
 
   electron() {
@@ -777,21 +876,25 @@ class DualWindow {
           img.draggable = false;
           img.addEventListener("load", this.boundSize);
           overlay.appendChild(img);
+          this.addLaserLayer(overlay);
           this.imgs.push(img);
         } else {
           const mk = (role) => {
             const half = this.doc.createElement("div");
             half.className = "drm-half";
+            half.style.position = "relative";
             const img = this.doc.createElement("img");
             img.className = "drm-content drm-img";
             img.dataset.role = role;
             img.draggable = false;
             img.addEventListener("load", this.boundSize);
             half.appendChild(img);
+            this.addLaserLayer(half);
             overlay.appendChild(half);
             this.imgs.push(img);
           };
           mk("a");
+          overlay.appendChild(this.makeDivider());
           mk("b");
         }
         this.attachViewportListeners(overlay);
@@ -865,19 +968,23 @@ class DualWindow {
           el.className = "drm-content drm-single-text";
           el.dataset.role = "single";
           overlay.appendChild(el);
+          this.addLaserLayer(overlay);
           this.imgs.push(el);
         } else {
           const mk = (role) => {
             const half = this.doc.createElement("div");
             half.className = "drm-half";
+            half.style.position = "relative";
             const el = this.doc.createElement("div");
             el.className = "drm-content drm-text";
             el.dataset.role = role;
             half.appendChild(el);
+            this.addLaserLayer(half);
             overlay.appendChild(half);
             this.imgs.push(el);
           };
           mk("a");
+          overlay.appendChild(this.makeDivider());
           mk("b");
         }
         this.attachViewportListeners(overlay);
@@ -1005,7 +1112,9 @@ class DualWindow {
     overlay.addEventListener("pointermove", this.onPointerMove);
     overlay.addEventListener("pointerup", this.onPointerUp);
     overlay.addEventListener("pointercancel", this.onPointerUp);
+    overlay.addEventListener("lostpointercapture", this.onLostCapture);
     overlay.addEventListener("dblclick", this.onDblClick);
+    overlay.addEventListener("contextmenu", this.onContextMenu);
   }
 
   handleWheel(e) {
@@ -1032,6 +1141,12 @@ class DualWindow {
   }
 
   handlePointerDown(e) {
+    if (e.button === 2) {
+      e.preventDefault();
+      e.stopPropagation();
+      this.laserStart(e);
+      return;
+    }
     if (e.button !== 0) return;
     e.stopPropagation();
     const surface = this.surfaceForEvent(e);
@@ -1044,6 +1159,13 @@ class DualWindow {
   }
 
   handlePointerMove(e) {
+    if (this._laser && e.pointerId === this._laser.id) {
+      // The right button can come up while another is still held, which
+      // fires no pointerup; the buttons mask still shows it.
+      if (!(e.buttons & 2)) this.laserEnd(e);
+      else this.laserMove(e);
+      return;
+    }
     if (!this._drag) return;
     const dx = e.clientX - this._drag.x;
     const dy = e.clientY - this._drag.y;
@@ -1059,12 +1181,168 @@ class DualWindow {
   }
 
   handlePointerUp(e) {
+    if (this._laser && e.pointerId === this._laser.id) {
+      this.laserEnd(e);
+      return;
+    }
     this._drag = null;
     const overlay = this.currentOverlay();
     if (overlay) {
       overlay.classList.remove("drm-dragging");
       try { overlay.releasePointerCapture(e.pointerId); } catch (err) {}
     }
+  }
+
+  /* ---- Laser pointer --------------------------------------------------- */
+
+  // A canvas over one surface (a half, or the single overlay) for the laser
+  // to draw on. Styled inline, like the split, so it never depends on the
+  // injected stylesheet.
+  addLaserLayer(surface) {
+    const c = this.doc.createElement("canvas");
+    c.className = "drm-laser";
+    c.style.cssText = "position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:1;";
+    surface.appendChild(c);
+  }
+
+  // The surface under a screen point: a half in dual (none over the
+  // divider), the overlay in single. Pointer capture retargets events to the
+  // overlay, so this goes by position rather than e.target.
+  laserSurfaceAt(x, y) {
+    const overlay = this.currentOverlay();
+    if (!overlay) return null;
+    if (this.mode === "single") return overlay;
+    for (const half of overlay.querySelectorAll(":scope > .drm-half")) {
+      const r = half.getBoundingClientRect();
+      if (x >= r.left && x < r.right && y >= r.top && y < r.bottom) return half;
+    }
+    return null;
+  }
+
+  // The size the picture actually paints at inside an element laid out by
+  // size(). Images are object-fit: contain, so letterboxing is left out.
+  static paintedSize(el) {
+    const w = el.offsetWidth, h = el.offsetHeight;
+    const nw = el.naturalWidth, nh = el.naturalHeight;
+    if (!nw || !nh || !w || !h) return { w, h };
+    const k = Math.min(w / nw, h / nh);
+    return { w: nw * k, h: nh * k };
+  }
+
+  // Screen point -> fraction of the picture (0..1 across and down), undoing
+  // this surface's rotation, pan and zoom. The element is centred in its
+  // surface and transformed as rotate -> translate -> scale about its centre.
+  laserToImage(surface, x, y) {
+    const el = surface.querySelector(".drm-content");
+    if (!el) return null;
+    const p = DualWindow.paintedSize(el);
+    if (!p.w || !p.h) return null;
+    const r = surface.getBoundingClientRect();
+    const d = DualWindow.rotateDelta(x - (r.left + r.width / 2), y - (r.top + r.height / 2), this.angleFor(el));
+    return {
+      x: (d.x - this.panX) / this.scale / p.w + 0.5,
+      y: (d.y - this.panY) / this.scale / p.h + 0.5,
+    };
+  }
+
+  // The reverse: a fraction of the picture -> a point in the surface's box.
+  laserFromImage(surface, pt) {
+    const el = surface.querySelector(".drm-content");
+    if (!el) return null;
+    const p = DualWindow.paintedSize(el);
+    const u = this.panX + (pt.x - 0.5) * p.w * this.scale;
+    const v = this.panY + (pt.y - 0.5) * p.h * this.scale;
+    const d = DualWindow.rotateDelta(u, v, -this.angleFor(el));
+    return { x: surface.clientWidth / 2 + d.x, y: surface.clientHeight / 2 + d.y };
+  }
+
+  laserStart(e) {
+    const overlay = this.currentOverlay();
+    if (!overlay) return;
+    this._laser = { id: e.pointerId };
+    this.laserPts = [];
+    this.laserDot = null;
+    try { overlay.setPointerCapture(e.pointerId); } catch (err) {}
+    this.laserMove(e);
+  }
+
+  laserMove(e) {
+    const surface = this.laserSurfaceAt(e.clientX, e.clientY);
+    const pt = surface && this.laserToImage(surface, e.clientX, e.clientY);
+    if (!pt) return;
+    const now = performance.now();
+    this.laserDot = pt;
+    this.laserPts.push({ x: pt.x, y: pt.y, t: now });
+    // Pruned here as well as when drawing, in case drawing is paused.
+    while (this.laserPts.length && now - this.laserPts[0].t >= LASER_TRAIL_MS) this.laserPts.shift();
+    this.laserQueueSend({ x: pt.x, y: pt.y, t: now });
+    this.laserKick();
+  }
+
+  laserEnd(e) {
+    if (!this._laser) return;
+    this._laser = null;
+    this.laserOffAt = performance.now();
+    const overlay = this.currentOverlay();
+    if (overlay && e) { try { overlay.releasePointerCapture(e.pointerId); } catch (err) {} }
+    this.laserFlush();
+    if (this.remote) this.remote.sendLaser(null);
+    this.laserKick();
+  }
+
+  // Sends to players at most every LASER_SEND_MS: the first move goes at
+  // once, later ones collapse into the latest position at each tick.
+  laserQueueSend(pt) {
+    if (!this.remote) return;
+    this._laserPending = pt;
+    if (this._laserTimer) return;
+    this.laserFlush();
+    this._laserTimer = window.setTimeout(() => {
+      this._laserTimer = null;
+      if (this._laserPending) this.laserQueueSend(this._laserPending);
+    }, LASER_SEND_MS);
+  }
+
+  laserFlush() {
+    const pt = this._laserPending;
+    this._laserPending = null;
+    if (pt && this.remote) this.remote.sendLaser(pt);
+  }
+
+  laserKick() {
+    if (this._laserRaf || !this.popup) return;
+    this._laserRaf = this.popup.requestAnimationFrame(() => this.laserDraw());
+  }
+
+  // Redraws every frame while the button is held (so the dot follows any
+  // zoom or pan too), then until the trail and dot have faded.
+  laserDraw() {
+    this._laserRaf = 0;
+    const overlay = this.currentOverlay();
+    if (!overlay || !this.popup) return;
+    const now = performance.now();
+    this.laserPts = this.laserPts.filter((p) => now - p.t < LASER_TRAIL_MS);
+    let dotAlpha = 0;
+    if (this.laserDot) {
+      dotAlpha = this._laser ? 1 : 1 - (now - this.laserOffAt) / LASER_FADE_MS;
+      if (dotAlpha <= 0) { this.laserDot = null; dotAlpha = 0; }
+    }
+    const dpr = this.popup.devicePixelRatio || 1;
+    for (const canvas of overlay.querySelectorAll(".drm-laser")) {
+      const surface = canvas.parentElement;
+      drawLaser(canvas, dpr, this.laserPts, this.laserDot, dotAlpha, now,
+        (pt) => this.laserFromImage(surface, pt));
+    }
+    if (this._laser || this.laserPts.length || this.laserDot) this.laserKick();
+  }
+
+  resetLaser() {
+    if (this._laserTimer) { window.clearTimeout(this._laserTimer); this._laserTimer = null; }
+    this._laser = null;
+    this._laserPending = null;
+    this._laserRaf = 0;
+    this.laserPts = [];
+    this.laserDot = null;
   }
 
   resetViewState() {
@@ -1093,9 +1371,33 @@ class DualWindow {
 
   // Split direction as an inline style, so it never depends on the injected
   // stylesheet. Row = left/right (landscape dual); column = top/bottom or single.
+  // The divider follows: a vertical rail for a row, a horizontal one otherwise.
   applySplit(overlay) {
     const row = this.mode === "dual" && this.config.orientation === "landscape";
     overlay.style.flexDirection = row ? "row" : "column";
+    const div = overlay.querySelector(":scope > .drm-divider");
+    if (div) {
+      const s = div.style;
+      s.display = this.config.divider ? "block" : "none";
+      s.flex = "0 0 " + DIVIDER_PX + "px";
+      s.boxSizing = "border-box";
+      s.background = DIVIDER_LIGHT;
+      s.borderStyle = "solid";
+      s.borderColor = DIVIDER_DARK;
+      s.borderWidth = row ? "0 " + DIVIDER_EDGE_PX + "px" : DIVIDER_EDGE_PX + "px 0";
+    }
+  }
+
+  makeDivider() {
+    const d = this.doc.createElement("div");
+    d.className = "drm-divider";
+    return d;
+  }
+
+  refreshDivider() {
+    const overlay = this.currentOverlay();
+    if (overlay) this.applySplit(overlay);
+    this.relayout();
   }
 
   refreshOrientation() {
@@ -1163,6 +1465,7 @@ class DualWindow {
       try { this.popup.removeEventListener("resize", this.boundSize); } catch (e) {}
     }
     this._drag = null;
+    this.resetLaser();
     this.leaf = null;
     this.container = null;
     this.doc = null;
@@ -1464,6 +1767,15 @@ class DualViewController extends ItemView {
       cfg.orientation = cfg.orientation === "landscape" ? "portrait" : "landscape";
       await plugin.saveSettings();
       win.refreshOrientation();
+      this.render();
+    };
+
+    const dividerBtn = row.createEl("button", { text: "Divider: " + (cfg.divider ? "On" : "Off") });
+    dividerBtn.title = "The line between the two halves in dual mode";
+    dividerBtn.onclick = async () => {
+      cfg.divider = !cfg.divider;
+      await plugin.saveSettings();
+      win.refreshDivider();
       this.render();
     };
 
@@ -2213,6 +2525,9 @@ module.exports = class DualViewPlugin extends Plugin {
     if (typeof this.settings.broadcast !== "boolean") {
       this.settings.broadcast = DEFAULTS.broadcast;
     }
+    if (typeof this.settings.divider !== "boolean") {
+      this.settings.divider = DEFAULTS.divider;
+    }
     if (typeof this.settings.viewerBaseUrl !== "string") {
       this.settings.viewerBaseUrl = "";
     }
@@ -2246,6 +2561,9 @@ module.exports = class DualViewPlugin extends Plugin {
     }
     if (typeof this.settings.ambient.broadcast !== "boolean") {
       this.settings.ambient.broadcast = AMBIENT_DEFAULTS.broadcast;
+    }
+    if (typeof this.settings.ambient.divider !== "boolean") {
+      this.settings.ambient.divider = AMBIENT_DEFAULTS.divider;
     }
     // Premade scenes: keep well-formed entries only, each with a mode.
     const scenes = Array.isArray(this.settings.ambient.scenes) ? this.settings.ambient.scenes : [];
@@ -2360,6 +2678,18 @@ class DualViewSettings extends PluginSettingTab {
           this.plugin.settings.orientation = v ? "landscape" : "portrait";
           await this.plugin.saveSettings();
           this.plugin.dual.refreshOrientation();
+          this.plugin.refreshController();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Divider")
+      .setDesc("Dual view: a narrow light line with dark edges between the two halves, so the split is clear even where the picture runs into itself. The ambient screen has its own switch in the controller.")
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.divider).onChange(async (v) => {
+          this.plugin.settings.divider = v;
+          await this.plugin.saveSettings();
+          this.plugin.dual.refreshDivider();
           this.plugin.refreshController();
         })
       );
