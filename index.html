@@ -765,39 +765,58 @@
   /* ---- Laser pointer ----------------------------------------------------- */
 
   // The DM holds the right mouse button on their table screen and the plugin
-  // sends where it is as fractions of the image (0..1 across and down).
-  // Drawing from fractions keeps the dot on the same spot of the map whatever
-  // this window's size, zoom or pan. The trail is built here from those same
-  // positions, so it costs nothing extra to send.
+  // sends where it is as fractions of the image (0..1 across and down), about
+  // 30 times a second, each stamped with when the cursor was there. Drawing
+  // from fractions keeps the dot on the same spot of the map whatever this
+  // window's size, zoom or pan.
+  //
+  // The stroke is replayed LASER_DELAY_MS behind, by those timestamps, along a
+  // smooth curve through the points. So messages arriving unevenly don't make
+  // it stutter, and the trail (the replayed path, recorded every frame) curves
+  // instead of kinking at each point. None of this costs anything to send.
   var LASER_TRAIL_MS = 400;
   var LASER_FADE_MS = 1000;
+  var LASER_DELAY_MS = 70;
   var LASER_DOT_R = 8;
   var laserCanvas = document.getElementById("laser");
-  var laser = { active: false, pts: [], dot: null, offAt: 0, raf: 0 };
+  var laser = { active: false, samples: [], offset: null, dot: null, pts: [], offAt: 0, raf: 0 };
 
   function laserPoint(msg) {
     var x = Number(msg.x), y = Number(msg.y);
     if (!isFinite(x) || !isFinite(y)) return;
     var now = performance.now();
+    // Without a timestamp (an older plugin), arrival time stands in for it.
+    var t = typeof msg.t === "number" && isFinite(msg.t) ? msg.t : now;
+    if (!laser.active) {
+      // A new stroke starts clean rather than joining onto the last one.
+      laser.samples = [];
+      laser.pts = [];
+      laser.offset = null;
+    }
     laser.active = true;
-    laser.dot = { x: x, y: y };
-    laser.pts.push({ x: x, y: y, t: now });
-    // Pruned here too, since drawing pauses while the tab is hidden.
-    while (laser.pts.length && now - laser.pts[0].t >= LASER_TRAIL_MS) laser.pts.shift();
+    // The smallest gap between their clock and ours belongs to the quickest
+    // message; replaying against it leaves room for the slower ones.
+    var off = now - t;
+    if (laser.offset === null || off < laser.offset) laser.offset = off;
+    var last = laser.samples[laser.samples.length - 1];
+    if (!last || t > last.t) laser.samples.push({ x: x, y: y, t: t });
     laserKick();
   }
 
   function laserOff() {
     if (!laser.active) return;
     laser.active = false;
-    laser.offAt = performance.now();
+    // Fade once the replay has caught up with the last point.
+    laser.offAt = performance.now() + LASER_DELAY_MS;
     laserKick();
   }
 
   function laserReset() {
     laser.active = false;
-    laser.pts = [];
+    laser.samples = [];
+    laser.offset = null;
     laser.dot = null;
+    laser.pts = [];
     laserKick(); // one last frame clears the canvas
   }
 
@@ -805,16 +824,48 @@
     if (!laser.raf) laser.raf = requestAnimationFrame(laserDraw);
   }
 
+  // Where the stroke was at time rt (the DM's clock): a Catmull-Rom curve,
+  // which passes through every received point without corners.
+  function laserAt(rt) {
+    var s = laser.samples;
+    if (!s.length) return null;
+    // Points two behind the replay no longer shape the curve.
+    while (s.length > 3 && s[2].t <= rt) s.shift();
+    if (rt <= s[0].t) return { x: s[0].x, y: s[0].y };
+    var i = 0;
+    while (i < s.length - 1 && s[i + 1].t <= rt) i++;
+    if (i === s.length - 1) return { x: s[i].x, y: s[i].y };
+    var p0 = s[i - 1] || s[i], p1 = s[i], p2 = s[i + 1], p3 = s[i + 2] || s[i + 1];
+    var u = (rt - p1.t) / (p2.t - p1.t), u2 = u * u, u3 = u2 * u;
+    function cr(a, b, c, d) {
+      return 0.5 * (2 * b + (c - a) * u + (2 * a - 5 * b + 4 * c - d) * u2 + (3 * b - a - 3 * c + d) * u3);
+    }
+    return { x: cr(p0.x, p1.x, p2.x, p3.x), y: cr(p0.y, p1.y, p2.y, p3.y) };
+  }
+
   // Redraws every frame while the DM is pointing (so the dot stays put on
   // the map while this player zooms or pans), then until it has faded.
   function laserDraw() {
     laser.raf = 0;
     var now = performance.now();
+    var at = laser.offset === null ? null : laserAt(now - laser.offset - LASER_DELAY_MS);
+    if (at) {
+      laser.dot = at;
+      var last = laser.pts[laser.pts.length - 1];
+      if (!last || Math.abs(last.x - at.x) > 1e-4 || Math.abs(last.y - at.y) > 1e-4) {
+        laser.pts.push({ x: at.x, y: at.y, t: now });
+      }
+    }
     laser.pts = laser.pts.filter(function (p) { return now - p.t < LASER_TRAIL_MS; });
     var dotAlpha = 0;
     if (laser.dot) {
-      dotAlpha = laser.active ? 1 : 1 - (now - laser.offAt) / LASER_FADE_MS;
-      if (dotAlpha <= 0) { laser.dot = null; dotAlpha = 0; }
+      dotAlpha = laser.active ? 1 : Math.min(1, 1 - (now - laser.offAt) / LASER_FADE_MS);
+      if (dotAlpha <= 0) {
+        laser.dot = null;
+        laser.samples = [];
+        laser.offset = null;
+        dotAlpha = 0;
+      }
     }
 
     var dpr = window.devicePixelRatio || 1;
@@ -838,28 +889,42 @@
       g.lineJoin = "round";
       g.shadowColor = "rgba(255, 42, 42, 0.8)";
       g.shadowBlur = 10;
-      // Older points are thinner and fainter, so the trail tapers to nothing.
-      for (var i = 1; i < laser.pts.length; i++) {
-        var a = place(laser.pts[i - 1]), b = place(laser.pts[i]);
-        var k = Math.max(0, 1 - (now - laser.pts[i].t) / LASER_TRAIL_MS);
+      // The trail tapers: older stretches are thinner and fainter. It's drawn
+      // in a few age bands, each as one continuous path, because stroking
+      // every little segment on its own overlaps their round ends into beads.
+      var BANDS = 8, pts = laser.pts;
+      var bandOf = function (p) {
+        return Math.max(0, Math.min(BANDS - 1, Math.floor((1 - (now - p.t) / LASER_TRAIL_MS) * BANDS)));
+      };
+      var start = 0;
+      while (start < pts.length - 1) {
+        var b = bandOf(pts[start + 1]);
+        var end = start + 1;
+        while (end + 1 < pts.length && bandOf(pts[end + 1]) === b) end++;
+        var k = (b + 1) / BANDS;
         g.strokeStyle = "rgba(255, 42, 42, " + (0.9 * k).toFixed(3) + ")";
         g.lineWidth = 2 + 5 * k;
         g.beginPath();
-        g.moveTo(a.x, a.y);
-        g.lineTo(b.x, b.y);
+        var q = place(pts[start]);
+        g.moveTo(q.x, q.y);
+        for (var j = start + 1; j <= end; j++) {
+          q = place(pts[j]);
+          g.lineTo(q.x, q.y);
+        }
         g.stroke();
+        start = end;
       }
       if (laser.dot && dotAlpha > 0) {
-        var q = place(laser.dot);
+        var d = place(laser.dot);
         g.globalAlpha = dotAlpha;
         g.fillStyle = "#ff2a2a";
         g.beginPath();
-        g.arc(q.x, q.y, LASER_DOT_R, 0, Math.PI * 2);
+        g.arc(d.x, d.y, LASER_DOT_R, 0, Math.PI * 2);
         g.fill();
         g.shadowBlur = 0;
         g.fillStyle = "#ffffff";
         g.beginPath();
-        g.arc(q.x, q.y, LASER_DOT_R * 0.35, 0, Math.PI * 2);
+        g.arc(d.x, d.y, LASER_DOT_R * 0.35, 0, Math.PI * 2);
         g.fill();
         g.globalAlpha = 1;
       }

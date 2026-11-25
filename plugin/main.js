@@ -560,12 +560,14 @@ class RemoteChannel {
   }
 
   // The laser pointer's position as fractions of the image (0..1 across and
-  // down), or null once it's let go. Images only: text wraps differently
-  // on each player's screen, so a spot on it wouldn't line up.
+  // down), or null once it's let go. `t` is when the cursor was there, in
+  // this computer's milliseconds, so players can replay the stroke at its
+  // real pace however unevenly the messages arrive. Images only: text wraps
+  // differently on each player's screen, so a spot on it wouldn't line up.
   sendLaser(pt) {
     if (!this.config.broadcast || !this.last || this.last.kind !== "image") return;
     const msg = pt
-      ? { k: "laser", x: Math.round(pt.x * 10000) / 10000, y: Math.round(pt.y * 10000) / 10000 }
+      ? { k: "laser", x: Math.round(pt.x * 10000) / 10000, y: Math.round(pt.y * 10000) / 10000, t: Math.round(pt.t) }
       : { k: "laser-off" };
     for (const conn of this.targets()) {
       try { conn.send(msg); } catch (e) {}
@@ -611,20 +613,29 @@ function drawLaser(canvas, dpr, pts, dot, dotAlpha, now, place) {
   g.lineJoin = "round";
   g.shadowColor = "rgba(255, 42, 42, 0.8)";
   g.shadowBlur = 10;
-  // Older points are thinner and fainter, so the trail tapers to nothing.
-  let prev = null;
-  for (const p of pts) {
-    const q = place(p);
-    if (prev && q) {
-      const k = Math.max(0, 1 - (now - p.t) / LASER_TRAIL_MS);
-      g.strokeStyle = "rgba(255, 42, 42, " + (0.9 * k).toFixed(3) + ")";
-      g.lineWidth = 2 + 5 * k;
-      g.beginPath();
-      g.moveTo(prev.x, prev.y);
-      g.lineTo(q.x, q.y);
-      g.stroke();
+  // The trail tapers: older stretches are thinner and fainter. It's drawn in
+  // a few age bands, each as one continuous path, because stroking every
+  // little segment on its own overlaps their round ends into visible beads.
+  const BANDS = 8;
+  const bandOf = (p) => Math.max(0, Math.min(BANDS - 1, Math.floor((1 - (now - p.t) / LASER_TRAIL_MS) * BANDS)));
+  const spots = pts.map(place);
+  let start = 0;
+  while (start < pts.length - 1) {
+    const b = bandOf(pts[start + 1]);
+    let end = start + 1;
+    while (end + 1 < pts.length && bandOf(pts[end + 1]) === b) end++;
+    const k = (b + 1) / BANDS;
+    g.strokeStyle = "rgba(255, 42, 42, " + (0.9 * k).toFixed(3) + ")";
+    g.lineWidth = 2 + 5 * k;
+    g.beginPath();
+    let open = false;
+    for (let j = start; j <= end; j++) {
+      const q = spots[j];
+      if (!q) { open = false; continue; }
+      if (open) g.lineTo(q.x, q.y); else { g.moveTo(q.x, q.y); open = true; }
     }
-    prev = q;
+    g.stroke();
+    start = end;
   }
   const q = dot && dotAlpha > 0 ? place(dot) : null;
   if (q) {
@@ -1264,7 +1275,7 @@ class DualWindow {
     this.laserPts.push({ x: pt.x, y: pt.y, t: now });
     // Pruned here as well as when drawing, in case drawing is paused.
     while (this.laserPts.length && now - this.laserPts[0].t >= LASER_TRAIL_MS) this.laserPts.shift();
-    this.laserQueueSend(pt);
+    this.laserQueueSend({ x: pt.x, y: pt.y, t: now });
     this.laserKick();
   }
 
