@@ -64,6 +64,16 @@
     line-height: 1.3;
   }
 
+  /* The DM's laser pointer, drawn over the picture. */
+  #laser {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    z-index: 5;
+  }
+
   /* Landing, empty and waiting states. */
   #idle {
     position: fixed;
@@ -232,6 +242,7 @@
 <div id="stage">
   <div id="content"></div>
 </div>
+<canvas id="laser"></canvas>
 
 <div id="idle">
   <h1 id="idleTitle">Remote Table</h1>
@@ -407,6 +418,8 @@
     var c = conn;
     conn = null;
     if (c) { try { c.close(); } catch (e) {} }
+    // A laser-off may never arrive over a dead link; don't leave the dot up.
+    laserReset();
   }
 
   function scheduleRetry(text, delay) {
@@ -555,7 +568,8 @@
     if (!isOpen()) retryNow();
   });
 
-  /* ---- Protocol: hello | ping | style | clear | text | head + chunks + end */
+  /* ---- Protocol: hello | ping | style | clear | text | head + chunks + end
+     | laser | laser-off */
 
   var incoming = null; // { id, parts: [], received, total, mime, bg }
   var currentUrl = null;
@@ -597,9 +611,20 @@
       return;
     }
 
+    if (msg.k === "laser") {
+      laserPoint(msg);
+      return;
+    }
+
+    if (msg.k === "laser-off") {
+      laserOff();
+      return;
+    }
+
     if (msg.k === "clear") {
       incoming = null;
       setProgress(null);
+      laserReset();
       clearContent();
       stage.style.background = "";
       idle.classList.remove("hidden");
@@ -612,6 +637,7 @@
     if (msg.k === "text") {
       incoming = null;
       setProgress(null);
+      laserReset();
       showText(msg);
       return;
     }
@@ -734,6 +760,112 @@
     div.textContent = msg.text || "";
     content.appendChild(div);
     applyColors();
+  }
+
+  /* ---- Laser pointer ----------------------------------------------------- */
+
+  // The DM holds the right mouse button on their table screen and the plugin
+  // sends where it is as fractions of the image (0..1 across and down).
+  // Drawing from fractions keeps the dot on the same spot of the map whatever
+  // this window's size, zoom or pan. The trail is built here from those same
+  // positions, so it costs nothing extra to send.
+  var LASER_TRAIL_MS = 400;
+  var LASER_FADE_MS = 1000;
+  var LASER_DOT_R = 8;
+  var laserCanvas = document.getElementById("laser");
+  var laser = { active: false, pts: [], dot: null, offAt: 0, raf: 0 };
+
+  function laserPoint(msg) {
+    var x = Number(msg.x), y = Number(msg.y);
+    if (!isFinite(x) || !isFinite(y)) return;
+    var now = performance.now();
+    laser.active = true;
+    laser.dot = { x: x, y: y };
+    laser.pts.push({ x: x, y: y, t: now });
+    // Pruned here too, since drawing pauses while the tab is hidden.
+    while (laser.pts.length && now - laser.pts[0].t >= LASER_TRAIL_MS) laser.pts.shift();
+    laserKick();
+  }
+
+  function laserOff() {
+    if (!laser.active) return;
+    laser.active = false;
+    laser.offAt = performance.now();
+    laserKick();
+  }
+
+  function laserReset() {
+    laser.active = false;
+    laser.pts = [];
+    laser.dot = null;
+    laserKick(); // one last frame clears the canvas
+  }
+
+  function laserKick() {
+    if (!laser.raf) laser.raf = requestAnimationFrame(laserDraw);
+  }
+
+  // Redraws every frame while the DM is pointing (so the dot stays put on
+  // the map while this player zooms or pans), then until it has faded.
+  function laserDraw() {
+    laser.raf = 0;
+    var now = performance.now();
+    laser.pts = laser.pts.filter(function (p) { return now - p.t < LASER_TRAIL_MS; });
+    var dotAlpha = 0;
+    if (laser.dot) {
+      dotAlpha = laser.active ? 1 : 1 - (now - laser.offAt) / LASER_FADE_MS;
+      if (dotAlpha <= 0) { laser.dot = null; dotAlpha = 0; }
+    }
+
+    var dpr = window.devicePixelRatio || 1;
+    var w = laserCanvas.clientWidth, h = laserCanvas.clientHeight;
+    var bw = Math.round(w * dpr), bh = Math.round(h * dpr);
+    if (laserCanvas.width !== bw || laserCanvas.height !== bh) {
+      laserCanvas.width = bw;
+      laserCanvas.height = bh;
+    }
+    var g = laserCanvas.getContext("2d");
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, w, h);
+
+    // The image's box is exactly the picture (no letterboxing), and its
+    // on-screen rect already includes this page's own zoom and pan.
+    var img = content.querySelector("img");
+    if (img && (laser.pts.length || laser.dot)) {
+      var r = img.getBoundingClientRect();
+      var place = function (p) { return { x: r.left + p.x * r.width, y: r.top + p.y * r.height }; };
+      g.lineCap = "round";
+      g.lineJoin = "round";
+      g.shadowColor = "rgba(255, 42, 42, 0.8)";
+      g.shadowBlur = 10;
+      // Older points are thinner and fainter, so the trail tapers to nothing.
+      for (var i = 1; i < laser.pts.length; i++) {
+        var a = place(laser.pts[i - 1]), b = place(laser.pts[i]);
+        var k = Math.max(0, 1 - (now - laser.pts[i].t) / LASER_TRAIL_MS);
+        g.strokeStyle = "rgba(255, 42, 42, " + (0.9 * k).toFixed(3) + ")";
+        g.lineWidth = 2 + 5 * k;
+        g.beginPath();
+        g.moveTo(a.x, a.y);
+        g.lineTo(b.x, b.y);
+        g.stroke();
+      }
+      if (laser.dot && dotAlpha > 0) {
+        var q = place(laser.dot);
+        g.globalAlpha = dotAlpha;
+        g.fillStyle = "#ff2a2a";
+        g.beginPath();
+        g.arc(q.x, q.y, LASER_DOT_R, 0, Math.PI * 2);
+        g.fill();
+        g.shadowBlur = 0;
+        g.fillStyle = "#ffffff";
+        g.beginPath();
+        g.arc(q.x, q.y, LASER_DOT_R * 0.35, 0, Math.PI * 2);
+        g.fill();
+        g.globalAlpha = 1;
+      }
+    }
+
+    if (laser.active || laser.pts.length || laser.dot) laserKick();
   }
 
   /* ---- Zoom and pan ------------------------------------------------------ */

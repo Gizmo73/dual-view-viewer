@@ -31,6 +31,26 @@ when the physical setup is mirrored from the default.
 - In dual view, zoom and pan are shared: dragging or scrolling on either half
   moves both in sync, since they're showing the same region of the same image.
 
+## Divider
+
+In dual view a narrow light line with dark edges runs between the two
+halves, so the split stays obvious even where the picture runs into its own
+mirror image. It takes its own few pixels rather than covering the picture.
+Turn it off with the **Divider** button in the controller (each screen has
+its own) or, for the main screen, in settings.
+
+## Laser pointer
+
+Hold the right mouse button on the main or ambient screen and move: a red
+dot with a short trail follows the cursor. In dual view it shows on both
+halves at the same spot of the image, and players watching that screen in
+their browser see it too, in the right place whatever their own zoom. It
+fades out shortly after you let go. Left-drag still pans, and the table
+screens no longer open a right-click menu.
+
+Players see it on images only, not on text, since text wraps differently on
+their screen.
+
 ## Install
 
 With [BRAT](https://github.com/TfTHacker/obsidian42-brat) (recommended, it
@@ -75,6 +95,7 @@ it reopens there from then on.
   landscape (cases 2 & 4). Also available as a command for quick switching.
 - **Swap sides**: flips the rotation, for a mirrored physical setup. Also
   available as a command.
+- **Divider**: the line between the two halves in dual view. On by default.
 - **Background colour**: shown behind the image (letterboxing).
 - **Remember window position**: on by default.
 
