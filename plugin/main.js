@@ -586,13 +586,87 @@ class RemoteChannel {
   }
 }
 
-// The rail between the two halves in dual view: a light line with dark
-// edges, so the split stands out on light and dark maps alike. It takes its
-// own space rather than covering the picture.
-const DIVIDER_PX = 7;
-const DIVIDER_EDGE_PX = 2;
-const DIVIDER_LIGHT = "#f4efe2";
-const DIVIDER_DARK = "#000000";
+// The divider between the two halves in dual view: a band of dark slate
+// inscribed with alchemical sigils, drawn as glowing lines in the campaign
+// colour, casting a shadow onto both halves so it reads as a bar lying
+// across two sheets. Map colours never look like that, so the split stays
+// obvious where the picture runs into its own mirror image. It takes its own
+// space rather than covering the picture.
+const DIVIDER_PX = 12;
+const DIVIDER_FALLBACK_HUE = 28; // amber, when the vault sets no campaign colour
+
+// Sigils in a unit box (-1..1, y down), drawn here rather than taken from a
+// font so they look the same on any computer: fire, gold, earth, silver,
+// air, mercury, water, the eye, salt, a star, sulfur.
+const sigilCircle = (x, y, r) => `M${x - r} ${y}A${r} ${r} 0 1 0 ${x + r} ${y}A${r} ${r} 0 1 0 ${x - r} ${y}`;
+const SIGILS = [
+  "M0 -1L.87 .6L-.87 .6Z",
+  sigilCircle(0, 0, 0.9) + sigilCircle(0, 0, 0.14),
+  "M0 1L.87 -.6L-.87 -.6ZM-.5 -.05L.5 -.05",
+  "M.35 -.92A.95 .95 0 1 0 .35 .92A.72 .72 0 1 1 .35 -.92Z",
+  "M0 -1L.87 .6L-.87 .6ZM-.5 .05L.5 .05",
+  sigilCircle(0, -0.15, 0.38) + "M-.42 -.95A.42 .42 0 0 0 .42 -.95M0 .23L0 1M-.32 .62L.32 .62",
+  "M0 1L.87 -.6L-.87 -.6Z",
+  "M-1 0Q0 -.85 1 0Q0 .85 -1 0Z" + sigilCircle(0, 0, 0.28),
+  sigilCircle(0, 0, 0.85) + "M-.85 0L.85 0",
+  "M0 -1L0 1M-1 0L1 0M-.55 -.55L.55 .55M.55 -.55L-.55 .55",
+  "M0 -1L.58 0L-.58 0ZM0 0L0 1M-.38 .55L.38 .55",
+];
+
+// Hue (0-359) of an RGB colour, or null for a grey that has none.
+function hueOf(r, g, b) {
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn;
+  if (d < 12) return null;
+  const h = mx === r ? ((g - b) / d) % 6 : mx === g ? (b - r) / d + 2 : (r - g) / d + 4;
+  return Math.round((h * 60 + 360) % 360);
+}
+
+// The band's colours from one hue. Only the hue of the campaign colour is
+// kept: a dark accent (a deep red, say) would barely glow, so the halo, the
+// bright line and the edge are lit versions of it, and the slate takes a
+// faint tint of it.
+function bandColours(hue) {
+  return {
+    glow: `hsl(${hue}, 85%, 62%)`,
+    core: `hsl(${hue}, 100%, 90%)`,
+    edge: `hsl(${hue}, 60%, 48%)`,
+    tint: `hsl(${hue}, 35%, 16%)`,
+  };
+}
+
+// The band's CSS background for a horizontal ("h") or vertical ("v") divider
+// of thickness t: one repeating SVG tile holding every sigil once, with small
+// diamonds between them and a blurred copy underneath for the glow, over a
+// slate gradient. Built once per direction and hue.
+const bandCache = new Map();
+function arcaneBand(dir, t, hue) {
+  const key = dir + t + ":" + hue;
+  if (bandCache.has(key)) return bandCache.get(key);
+  const c = bandColours(hue);
+  const size = t * 0.62, step = Math.round(t * 2.1), len = step * SIGILS.length, mid = t / 2;
+  let paths = "", seps = "";
+  SIGILS.forEach((d, i) => {
+    paths += `<path vector-effect="non-scaling-stroke" transform="translate(${step * i + step / 2} ${mid}) scale(${size / 2})" d="${d}"/>`;
+  });
+  for (let i = 0; i <= SIGILS.length; i++) {
+    const x = step * i, s = t * 0.1;
+    seps += `<path d="M${x} ${mid - s}L${x + s} ${mid}L${x} ${mid + s}L${x - s} ${mid}Z"/>`;
+  }
+  const art =
+    `<defs><g id="s">${paths}</g>` +
+    `<filter id="b" filterUnits="userSpaceOnUse" x="0" y="0" width="${len}" height="${t}"><feGaussianBlur stdDeviation="${(t / 9).toFixed(2)}"/></filter></defs>` +
+    `<g fill="none" stroke-linecap="round" stroke-linejoin="round">` +
+    `<use href="#s" stroke="${c.glow}" stroke-width="${(t / 4.5).toFixed(2)}" filter="url(#b)"/>` +
+    `<use href="#s" stroke="${c.core}" stroke-width="${Math.max(0.8, t / 13).toFixed(2)}"/></g>` +
+    `<g fill="${c.glow}" opacity=".75">${seps}</g>`;
+  const svg = dir === "h"
+    ? `<svg xmlns="http://www.w3.org/2000/svg" width="${len}" height="${t}">${art}</svg>`
+    : `<svg xmlns="http://www.w3.org/2000/svg" width="${t}" height="${len}"><g transform="translate(${t} 0) rotate(90)">${art}</g></svg>`;
+  const slate = `linear-gradient(${dir === "h" ? 180 : 90}deg, #0b0d12, ${c.tint} 50%, #0b0d12)`;
+  const css = `url('data:image/svg+xml,${encodeURIComponent(svg)}') center / auto ${dir === "h" ? "repeat-x" : "repeat-y"}, ${slate}`;
+  bandCache.set(key, css);
+  return css;
+}
 
 // Laser pointer: hold the right mouse button on a table screen.
 const LASER_TRAIL_MS = 400;  // how long the trail lingers behind the dot
@@ -1371,20 +1445,25 @@ class DualWindow {
 
   // Split direction as an inline style, so it never depends on the injected
   // stylesheet. Row = left/right (landscape dual); column = top/bottom or single.
-  // The divider follows: a vertical rail for a row, a horizontal one otherwise.
+  // The divider follows: a vertical band for a row, a horizontal one
+  // otherwise. It sits above both halves so its shadow falls across them.
   applySplit(overlay) {
     const row = this.mode === "dual" && this.config.orientation === "landscape";
     overlay.style.flexDirection = row ? "row" : "column";
     const div = overlay.querySelector(":scope > .drm-divider");
     if (div) {
+      const hue = this.plugin.campaignHue == null ? DIVIDER_FALLBACK_HUE : this.plugin.campaignHue;
       const s = div.style;
       s.display = this.config.divider ? "block" : "none";
       s.flex = "0 0 " + DIVIDER_PX + "px";
+      s.position = "relative";
+      s.zIndex = "2";
       s.boxSizing = "border-box";
-      s.background = DIVIDER_LIGHT;
+      s.background = arcaneBand(row ? "v" : "h", DIVIDER_PX, hue);
       s.borderStyle = "solid";
-      s.borderColor = DIVIDER_DARK;
-      s.borderWidth = row ? "0 " + DIVIDER_EDGE_PX + "px" : DIVIDER_EDGE_PX + "px 0";
+      s.borderColor = bandColours(hue).edge;
+      s.borderWidth = row ? "0 1px" : "1px 0";
+      s.boxShadow = "0 0 12px 4px rgba(0, 0, 0, 0.7)";
     }
   }
 
@@ -1907,6 +1986,16 @@ module.exports = class DualViewPlugin extends Plugin {
     // Ambient scene art defaults to a single upright image, not the split.
     this.ambient.mode = "single";
 
+    // The divider glows in the campaign colour, which changes as campaign
+    // notes are opened (or the CSS changes), so look again after any of
+    // those settles and repaint both screens if it moved.
+    this.campaignHue = this.readCampaignHue();
+    const recheckCampaign = debounce(() => this.refreshCampaignColour(), 150, true);
+    for (const ev of ["active-leaf-change", "layout-change", "file-open", "css-change"]) {
+      this.registerEvent(this.app.workspace.on(ev, recheckCampaign));
+    }
+    this.registerEvent(this.app.metadataCache.on("changed", recheckCampaign));
+
     // Premade scenes store a vault path, so follow the image (or a folder
     // above it) when it's renamed or moved rather than silently breaking.
     this.registerEvent(
@@ -2193,6 +2282,40 @@ module.exports = class DualViewPlugin extends Plugin {
   }
 
   // --- Ambient window (manual, image-only, fully independent) --------
+
+  // The hue of the vault's campaign colour (--campaign-color), for the
+  // divider. A snippet switches it on this main window's body from the open
+  // notes' cssclasses (body:has(.CoS) and so on), which the table screens
+  // never match, so it's read from here and handed to them. Any CSS colour
+  // works; amber when it's unset, invalid or grey.
+  readCampaignHue() {
+    try {
+      const value = getComputedStyle(document.body).getPropertyValue("--campaign-color").trim();
+      if (!value || !CSS.supports("color", value)) return DIVIDER_FALLBACK_HUE;
+      // Paint it and read the pixel back: that resolves any colour syntax
+      // (rgb, hsl, oklch, names) to plain RGB.
+      const canvas = document.createElement("canvas");
+      canvas.width = canvas.height = 1;
+      const g = canvas.getContext("2d");
+      g.fillStyle = value;
+      g.fillRect(0, 0, 1, 1);
+      const px = g.getImageData(0, 0, 1, 1).data;
+      const hue = hueOf(px[0], px[1], px[2]);
+      return hue == null ? DIVIDER_FALLBACK_HUE : hue;
+    } catch (e) {
+      return DIVIDER_FALLBACK_HUE;
+    }
+  }
+
+  refreshCampaignColour() {
+    const hue = this.readCampaignHue();
+    if (hue === this.campaignHue) return;
+    this.campaignHue = hue;
+    for (const win of [this.dual, this.ambient]) {
+      const overlay = win.container && win.currentOverlay();
+      if (overlay) win.applySplit(overlay);
+    }
+  }
 
   // Sends an ad hoc image to the ambient screen and records it in this
   // session's scene list, reusing the entry if that image was already sent.
@@ -2684,7 +2807,7 @@ class DualViewSettings extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Divider")
-      .setDesc("Dual view: a narrow light line with dark edges between the two halves, so the split is clear even where the picture runs into itself. The ambient screen has its own switch in the controller.")
+      .setDesc("Dual view: a narrow band of glowing sigils between the two halves, so the split is clear even where the picture runs into itself. It glows in your --campaign-color if your theme sets one. The ambient screen has its own switch in the controller.")
       .addToggle((t) =>
         t.setValue(this.plugin.settings.divider).onChange(async (v) => {
           this.plugin.settings.divider = v;

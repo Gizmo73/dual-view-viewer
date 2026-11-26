@@ -33,11 +33,17 @@ when the physical setup is mirrored from the default.
 
 ## Divider
 
-In dual view a narrow light line with dark edges runs between the two
-halves, so the split stays obvious even where the picture runs into its own
-mirror image. It takes its own few pixels rather than covering the picture.
-Turn it off with the **Divider** button in the controller (each screen has
-its own) or, for the main screen, in settings.
+In dual view a 12px band runs between the two halves: dark slate inscribed
+with alchemical sigils drawn as glowing lines, casting a shadow onto both
+halves. Map art never looks like that, so the split stays obvious even where
+the picture runs into its own mirror image. It takes its own space rather
+than covering the picture. Turn it off with the **Divider** button in the
+controller (each screen has its own) or, for the main screen, in settings.
+
+The glow follows your theme's `--campaign-color`, read from the main
+Obsidian window and updated live as you open notes from another campaign or
+change your CSS. Only its hue is used, brightened so even a dark accent
+glows. With no `--campaign-color` it glows amber.
 
 ## Laser pointer
 
@@ -95,7 +101,7 @@ it reopens there from then on.
   landscape (cases 2 & 4). Also available as a command for quick switching.
 - **Swap sides**: flips the rotation, for a mirrored physical setup. Also
   available as a command.
-- **Divider**: the line between the two halves in dual view. On by default.
+- **Divider**: the sigil band between the two halves in dual view. On by default.
 - **Background colour**: shown behind the image (letterboxing).
 - **Remember window position**: on by default.
 
